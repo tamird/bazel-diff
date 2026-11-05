@@ -760,6 +760,7 @@ fn fingerprint_flags(
             args.exclude_external_targets.to_string(),
         ),
         ("keepGoing".into(), args.keep_going.to_string()),
+        ("cycleComponents".into(), "1".into()),
         ("stackSourcePaths".into(), "1".into()),
     ]);
     if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
