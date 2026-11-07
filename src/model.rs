@@ -261,6 +261,7 @@ impl Serialize for SerializedMetadata<'_> {
         let mut state = serializer.serialize_struct(
             "HashMetadata",
             usize::from(self.data.repository_membership.is_some())
+                + usize::from(self.data.observed_toolchains.is_some())
                 + usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
                 + usize::from(self.data.dependency_fingerprint.is_some())
@@ -268,6 +269,9 @@ impl Serialize for SerializedMetadata<'_> {
                 + usize::from(self.data.tree.is_some())
                 + usize::from(self.data.configured_roots.is_some()),
         )?;
+        if let Some(index) = &self.data.observed_toolchains {
+            state.serialize_field("observedToolchains", index)?;
+        }
         if let Some(membership) = &self.data.repository_membership {
             state.serialize_field("repositoryMembership", membership)?;
         }
@@ -311,7 +315,8 @@ impl Serialize for SerializedHashFile<'_> {
             hashes: &self.data.hashes,
             include_target_type: self.include_target_type,
         };
-        if self.data.repository_membership.is_none()
+        if self.data.observed_toolchains.is_none()
+            && self.data.repository_membership.is_none()
             && self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
@@ -340,6 +345,7 @@ pub struct HashFileData {
     pub configured_roots: Option<ConfiguredRoots>,
     pub hashes: BTreeMap<String, TargetHash>,
     pub repository_membership: Option<RepositoryMembership>,
+    pub observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
@@ -504,6 +510,7 @@ impl<'de> Deserialize<'de> for Hashes {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Metadata {
+    observed_toolchains: Option<crate::toolchain_candidates::ObservedToolchains>,
     repository_membership: Option<RepositoryMembership>,
     configured_roots: Option<ConfiguredRoots>,
     module_graph_json: Option<String>,
@@ -544,6 +551,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                         "metadata" => {
                             let metadata = map.next_value::<Metadata>()?;
                             data.repository_membership = metadata.repository_membership;
+                            data.observed_toolchains = metadata.observed_toolchains;
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
@@ -644,7 +652,8 @@ impl HashFileData {
                 )
             })
             .collect::<Map<_, _>>();
-        if self.repository_membership.is_none()
+        if self.observed_toolchains.is_none()
+            && self.repository_membership.is_none()
             && self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
@@ -655,6 +664,13 @@ impl HashFileData {
             return Value::Object(hashes);
         }
         let mut metadata = Map::new();
+        if let Some(index) = &self.observed_toolchains {
+            metadata.insert(
+                "observedToolchains".into(),
+                serde_json::to_value(index)
+                    .expect("serializing toolchain observations cannot fail"),
+            );
+        }
         if let Some(membership) = &self.repository_membership {
             metadata.insert(
                 "repositoryMembership".to_owned(),

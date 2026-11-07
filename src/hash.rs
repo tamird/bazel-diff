@@ -204,6 +204,21 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 }
 
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
+    generate_hashes_timed_with_observations(options, false)
+}
+
+/// Retains supplemental loading-phase facts while generating a fresh ordinary graph.
+pub fn generate_hashes_with_toolchain_inputs(options: &HashOptions) -> Result<HashFileData> {
+    if options.bazel.use_cquery || options.partial_tree.is_some() {
+        anyhow::bail!("--includeToolchainInputs requires fresh ordinary generation");
+    }
+    generate_hashes_timed_with_observations(options, true).map(|(file, _)| file)
+}
+
+fn generate_hashes_timed_with_observations(
+    options: &HashOptions,
+    include_toolchain_inputs: bool,
+) -> Result<(HashFileData, GenerationTimings)> {
     if options.bazel.isolated_dependency_root.is_some()
         && (options.content_hashes.is_some()
             || !options.modified_filepaths.is_empty()
@@ -247,6 +262,26 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
             definition_digests.extend(digests.drain(..).flatten());
         }
     })?;
+    let observations = if include_toolchain_inputs {
+        match options.bazel.observed_toolchains(
+            &queried.targets,
+            queried.root_mapping.as_deref(),
+            options.track_deps,
+        ) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                options.bazel.check_cancelled()?;
+                eprintln!("[Warn] toolchain declaration observation unavailable: {error:#}");
+                Some(crate::toolchain_candidates::ObservedToolchains {
+                    version: 1,
+                    unresolved: BTreeSet::from(["declaration observation unavailable".into()]),
+                    ..Default::default()
+                })
+            }
+        }
+    } else {
+        None
+    };
     let bazel_query_millis = elapsed_millis(query_started);
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
@@ -278,6 +313,7 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     if !options.bazel.use_cquery && data.module_graph_json.is_some() {
         data.repository_membership = Some(membership);
     }
+    data.observed_toolchains = observations;
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
 }
@@ -733,6 +769,7 @@ fn hash_targets_with_environment(
         partial = Some(recipes);
     }
     Ok(HashFileData {
+        observed_toolchains: None,
         repository_membership: None,
         hashes,
         configured_roots,

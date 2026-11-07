@@ -44,7 +44,13 @@ enum Commands {
         name = "generate-hashes",
         about = "Write canonical hashes for Bazel targets in a workspace"
     )]
-    GenerateHashes(GenerateHashesArgs),
+    GenerateHashes {
+        #[command(flatten)]
+        args: GenerateHashesArgs,
+        /// Preserve observed native declaration bindings and, with -d, ordinary type references.
+        #[arg(long = "includeToolchainInputs")]
+        include_toolchain_inputs: bool,
+    },
     #[command(
         name = "get-impacted-targets",
         about = "Compare two hash files and report impacted targets"
@@ -260,6 +266,9 @@ struct GenerateHashesArgs {
 
 #[derive(Debug, Args)]
 struct GetImpactedTargetsArgs {
+    /// Write positive toolchain reader observations. Absence cannot exclude a scheduled target.
+    #[arg(long = "toolchainCandidatesFile", requires = "dep_edges_file")]
+    toolchain_candidates_file: Option<PathBuf>,
     #[arg(long = "startingHashes")]
     starting_hashes: PathBuf,
 
@@ -929,8 +938,9 @@ fn partial_graph_hashes(
     );
     let fallback = match &args.base_hashes {
         Some(path) => {
-            let base = HashFileData::read(path)
+            let mut base = HashFileData::read(path)
                 .with_context(|| format!("failed to read --baseHashes {}", path.display()))?;
+            base.observed_toolchains = None;
             match (base.partial.as_ref(), base.tree.as_deref()) {
                 (None, _) => {
                     format!("{} carries no partial-graph recipes", path.display())
@@ -1061,6 +1071,24 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             target_types.as_ref(),
             exclude_external,
         )?;
+        if let Some(path) = &args.toolchain_candidates_file {
+            if to.configured_roots.is_some() {
+                bail!("--toolchainCandidatesFile requires ordinary hashes");
+            }
+            let mut report = bazel_diff::toolchain_candidates::compare(&from, &to);
+            bazel_diff::toolchain_candidates::add_returned_readers(&mut report, &to, &dep_edges);
+            let readers = std::mem::take(&mut report.possible_readers);
+            report.possible_readers = filter_and_sort_labels(
+                readers,
+                &from.hashes,
+                &to.hashes,
+                target_types.as_ref(),
+                exclude_external,
+            )?
+            .into_iter()
+            .collect();
+            write_json_file(File::create(path)?, &report)?;
+        }
         if args.report_repository_membership {
             serde_json::to_string(&bazel_diff::model::repository_impact_evidence(
                 &from, &to, &dep_edges, distances,
@@ -1375,8 +1403,22 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse_from(normalized_argv());
     match &cli.command {
-        Commands::GenerateHashes(args) => {
-            run_generate(args, cli.verbose)?;
+        Commands::GenerateHashes {
+            args,
+            include_toolchain_inputs,
+        } => {
+            if *include_toolchain_inputs {
+                if args.partial_graph || args.hashing.use_cquery {
+                    bail!("--includeToolchainInputs requires fresh ordinary generation");
+                }
+                run_generate_with(
+                    args,
+                    cli.verbose,
+                    bazel_diff::hash::generate_hashes_with_toolchain_inputs,
+                )?;
+            } else {
+                run_generate(args, cli.verbose)?;
+            }
         }
         Commands::GetImpactedTargets(args) => run_get_impacted(args, cli.verbose)?,
         Commands::Explain(args) => run_explain(args, cli.verbose)?,
@@ -1486,7 +1528,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let cli = Cli::try_parse_from(normalized).unwrap();
-        let Commands::GenerateHashes(args) = cli.command else {
+        let Commands::GenerateHashes { args, .. } = cli.command else {
             panic!("expected generate-hashes");
         };
         assert!(!args.hashing.use_cquery);
@@ -1582,7 +1624,7 @@ mod tests {
             stub_bazel.to_str().unwrap(),
             "hashes.json",
         ]);
-        let Commands::GenerateHashes(args) = cli.command else {
+        let Commands::GenerateHashes { args, .. } = cli.command else {
             panic!("expected generate-hashes");
         };
         let options = bazel_options(&args.hashing, false).unwrap();
@@ -2431,6 +2473,7 @@ mod tests {
         )
         .unwrap();
         let base_args = || GetImpactedTargetsArgs {
+            toolchain_candidates_file: None,
             report_repository_membership: false,
             starting_hashes: from_path.clone(),
             final_hashes: to_path.clone(),
@@ -2700,7 +2743,7 @@ mod tests {
             "/opt/git",
             "out.json",
         ]);
-        let Commands::GenerateHashes(args) = cli.command else {
+        let Commands::GenerateHashes { args, .. } = cli.command else {
             panic!("expected generate-hashes");
         };
         assert!(args.partial_graph);
@@ -2710,7 +2753,7 @@ mod tests {
         );
         assert_eq!(args.base_hashes, Some(PathBuf::from("base.json")));
         assert_eq!(args.git_path, PathBuf::from("/opt/git"));
-        let Commands::GenerateHashes(defaults) =
+        let Commands::GenerateHashes { args: defaults, .. } =
             parse(&["bazel-diff", "generate-hashes", "-w", "."]).command
         else {
             panic!("expected generate-hashes");
@@ -2929,6 +2972,7 @@ mod tests {
         .unwrap();
         let error = run_get_impacted(
             &GetImpactedTargetsArgs {
+                toolchain_candidates_file: None,
                 report_repository_membership: false,
                 starting_hashes: from.clone(),
                 final_hashes: to.clone(),
