@@ -5,8 +5,7 @@ use bazel_diff::fingerprint;
 use bazel_diff::git::{self, DerivationPolicy, Git};
 use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
-    dep_edges_from_slice, filter_and_sort_labels, impacted_targets,
-    impacted_targets_with_distances, HashFileData,
+    dep_edges_from_slice, filter_and_sort_labels, impacted_targets, HashFileData,
 };
 use bazel_diff::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
@@ -763,6 +762,9 @@ fn fingerprint_flags(
         ("cycleComponents".into(), "1".into()),
         ("stackSourcePaths".into(), "1".into()),
     ]);
+    if !args.use_cquery {
+        flags.insert("moduleToolchainInputs".into(), "1".into());
+    }
     if !args.use_cquery && !fine_grained_repos.is_empty() && args.isolated_dependency_root.is_none()
     {
         flags.insert("fineAliasInputs".into(), "2".into());
@@ -896,6 +898,15 @@ fn partial_graph_hashes(
                     recipes.version,
                     partial::RECIPE_VERSION
                 ),
+                (Some(recipes), _)
+                    if recipes.configuration_fingerprint
+                        != bazel_diff::cache::configuration_fingerprint(options, false, true) =>
+                {
+                    format!(
+                        "{} carries a different partial-graph request configuration",
+                        path.display()
+                    )
+                }
                 (_, _)
                     if args.dep_edges_file.is_some()
                         && base.dep_edges.is_empty()
@@ -958,6 +969,7 @@ fn ensure_same_mode(from: &HashFileData, to: &HashFileData) -> Result<()> {
             "the starting and final hashes were not generated in the same mode: one carries --partialGraph recipes and the other does not, and hashes of the two modes are not comparable"
         );
     }
+    from.ensure_toolchain_mode_matches(to)?;
     if let (Some(from), Some(to)) = (&from.partial, &to.partial) {
         if from.version != to.version {
             bail!(
@@ -1019,17 +1031,18 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             }
             Cow::Owned(distance_from)
         };
-        serde_json::to_string(&impacted_targets_with_distances(
+        serde_json::to_string(&bazel_diff::model::impacted_with_terminal_distances(
             &distance_from,
             &to.hashes,
             &dep_edges,
+            &to.toolchain_implementations,
             target_types.as_ref(),
             exclude_external,
         )?)?
     } else {
         let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
         filter_and_sort_labels(
-            impacted,
+            bazel_diff::model::include_toolchain_registrations(impacted, &to),
             &from.hashes,
             &to.hashes,
             target_types.as_ref(),
@@ -1061,7 +1074,17 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
         max_depth: usize::try_from(args.max_depth).ok(),
         max_roots: args.max_root_causes,
     };
-    let outcome = explain::explain(&from.hashes, &to.hashes, &dep_edges, &args.target, limits)?;
+    let outcome = explain::explain_with_implementations(
+        &from.hashes,
+        &to.hashes,
+        &dep_edges,
+        to.toolchain_implementations
+            .get(&args.target)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        &args.target,
+        limits,
+    )?;
     for warning in &outcome.warnings {
         eprintln!("[Warning] {warning}");
     }
@@ -1081,15 +1104,21 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
 
 fn run_fingerprint(args: &FingerprintArgs) -> Result<()> {
     let flags = fingerprint_flags(&args.hashing, args.include_target_type, &args.target_type)?;
-    let inputs = fingerprint::gather(
-        &args.hashing.workspace(),
-        &args.hashing.bazel_path,
-        flags.clone(),
-    );
+    let mut inputs =
+        fingerprint::gather(&args.hashing.workspace(), &args.hashing.bazel_path, flags);
+    if inputs.bazel_version != "unknown" {
+        if let Some(producer) =
+            bazel_options(&args.hashing, false)?.toolchain_producer_fingerprint()?
+        {
+            inputs
+                .flags
+                .insert("moduleToolchainProducer".to_owned(), producer);
+        }
+    }
     fingerprint::write_json(
         args.output.as_deref(),
         &fingerprint::compute(&inputs),
-        &flags,
+        &inputs.flags,
     )
 }
 
@@ -2588,7 +2617,12 @@ mod tests {
     fn partial_base(repo: &Path, path: &Path) -> HashFileData {
         let git = Git::new("git", repo);
         let tree = git.snapshot_working_tree(&[]).unwrap();
+        let args = partial_generate_args(repo, path);
+        let options = hash_options(&args.hashing, None, None, false, false).unwrap();
         let recipes = bazel_diff::partial::PartialRecipes {
+            configuration_fingerprint: bazel_diff::cache::configuration_fingerprint(
+                &options, false, true,
+            ),
             version: bazel_diff::partial::RECIPE_VERSION,
             seed_hash: "00".repeat(32),
             package_seeds: true,
@@ -2700,6 +2734,18 @@ mod tests {
         let same = run_generate_with(&args, false, never).unwrap();
         assert_eq!(same.hashes, base.hashes);
         assert_eq!(same.tree, base.tree);
+
+        args.hashing
+            .bazel_command_options
+            .push("--noproto:possible_toolchain_types".into());
+        let changed = run_generate_with(&args, false, |_| {
+            bail!("regenerated with different options")
+        })
+        .unwrap_err();
+        assert!(changed
+            .to_string()
+            .contains("regenerated with different options"));
+        args.hashing.bazel_command_options.pop();
 
         // An uncommitted source edit is derived: no generation, a new tree, a moved hash.
         fs::write(repo.path().join("file.txt"), "two").unwrap();
@@ -2874,6 +2920,14 @@ mod tests {
         assert!(error.contains("same mode"), "{error}");
 
         partial.partial.as_mut().unwrap().version = bazel_diff::partial::RECIPE_VERSION;
+        let mut capable = partial.clone();
+        capable.module_toolchain_inputs = true;
+        assert!(ensure_same_mode(&capable, &partial).is_err());
+        let mut full_capable = capable.clone();
+        full_capable.partial = None;
+        let mut full_legacy = full_capable.clone();
+        full_legacy.module_toolchain_inputs = false;
+        assert!(ensure_same_mode(&full_capable, &full_legacy).is_err());
         let mut older = partial.clone();
         older.partial.as_mut().unwrap().version = bazel_diff::partial::RECIPE_VERSION - 1;
         let error = ensure_same_mode(&older, &partial).unwrap_err().to_string();

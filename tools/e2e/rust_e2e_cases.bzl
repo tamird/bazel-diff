@@ -88,6 +88,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::coarse_external_inputs_remain_unfetched_until_built",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::cquery_android_source_change_platforms",
                 "timeout": "moderate",
             },
@@ -113,6 +117,10 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::fine_aliases_track_the_selected_destination_with_fixed_inputs",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::fine_filegroups_can_reveal_the_first_toolchain_readers",
                 "timeout": "moderate",
             },
             {
@@ -157,6 +165,10 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::projected_toolchain_follows_a_foreign_filegroup",
                 "timeout": "moderate",
             },
             {

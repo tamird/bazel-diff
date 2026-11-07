@@ -84,6 +84,7 @@ pub fn configuration_fingerprint(
     hasher.update(b"cycleComponents=1\0");
     if !options.bazel.use_cquery {
         hasher.update(b"queryToolchainImplementations=1\0");
+        hasher.update(b"moduleToolchainInputs=1\0");
     }
     hasher.update(b"stackSourcePaths=1\0");
     if !options.bazel.use_cquery

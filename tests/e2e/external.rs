@@ -322,6 +322,38 @@ fn hub_named_by_canonical_name_is_fine_grained_under_its_apparent_name() {
             "{repo}: {impacted:?}"
         );
     }
+
+    // The alias list in the hub is unchanged when just a private spoke's version changes.
+    // A consumer that hashes the hub coarsely must still observe the changed spoke.
+    for workspace in [&first, &second] {
+        edit(&workspace.path().join("crates.bzl"), |text| {
+            text.replace("versions = json.encode(versions)", r#"versions = "fixed""#)
+        });
+    }
+    let out = tempfile::tempdir().unwrap();
+    let full_edges = out.path().join("full-edges.json");
+    let edge_option = format!("--depEdgesFile={}", full_edges.display());
+    let affected = diff_local(first.path(), second.path(), &[&edge_option]);
+    assert!(
+        affected
+            .iter()
+            .any(|label| label.trim_start_matches('@') == "//:uses_a"),
+        "{affected:?}"
+    );
+    init_git(second.path());
+    let partial_edges = out.path().join("partial-edges.json");
+    let edge_option = format!("--depEdgesFile={}", partial_edges.display());
+    let result = generate(
+        second.path(),
+        &out.path().join("partial.json"),
+        &["--partialGraph", &edge_option],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(dep_edges(&partial_edges), dep_edges(&full_edges));
 }
 
 // Module `ext`'s extension generates the `@crates` hub and its spokes, whose targets use a rule
@@ -407,13 +439,27 @@ fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents
     edit(&bumped.path().join("versions.json"), |text| {
         text.replace("\"b\": \"1.0\"", "\"b\": \"2.0\"")
     });
-    // Without the opt-in the conservative owner edge stays and the bump reaches both, which is
-    // what the issue reports.
+    let capable = supports_module_toolchain_inputs(first.path());
     let impacted = main(diff_local(first.path(), bumped.path(), &[]));
-    assert!(
-        impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
-        "{impacted:?}"
-    );
+    if capable {
+        // Coarse repository hashing includes the hub's own changed spokes dictionary.
+        assert_eq!(
+            impacted,
+            set(&["//:uses_a", "//:uses_b"]),
+            "ordinary coarse hub"
+        );
+        let affected = main(diff_local(
+            first.path(),
+            bumped.path(),
+            &["--fineGrainedHashExternalRepos", "@crates"],
+        ));
+        assert_eq!(affected, set(&["//:uses_b"]), "ordinary fine hub");
+    } else {
+        assert!(
+            impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
+            "{impacted:?}"
+        );
+    }
 
     // Without fine-graining every consumer of the `@crates` hub sees the bump.
     let impacted = main(diff_local(first.path(), bumped.path(), &label_only));
@@ -424,7 +470,11 @@ fn label_only_extension_bump_does_not_reach_users_of_the_owner_or_its_dependents
     // `dependent` and `//:uses_ext` really depend on `ext`: a change to its own tree reaches them.
     let changed_owner = copy_workspace("extension_owner_dependent_module");
     fs::write(changed_owner.path().join("ext/tool.sh"), "exit 1\n").unwrap();
-    for flags in [&label_only[..], &fine_grained[..]] {
+    let mut owner_cases = vec![&label_only[..], &fine_grained[..]];
+    if capable {
+        owner_cases.push(&[]);
+    }
+    for flags in owner_cases {
         let impacted = main(diff_local(first.path(), changed_owner.path(), flags));
         assert!(
             impacted.contains("//:uses_ext") && impacted.contains("//:uses_dependent"),
@@ -970,6 +1020,275 @@ fn isolated_dependency_root_keeps_hidden_spoke_changes() {
     assert!(!changed.contains("//outside:uses_owner"), "{changed:?}");
 }
 
+fn supports_module_toolchain_inputs(root: &std::path::Path) -> bool {
+    let mod_help = std::process::Command::new(bazel())
+        .current_dir(root)
+        .args(["help", "mod"])
+        .output()
+        .unwrap();
+    assert!(mod_help.status.success());
+    let with_registrations =
+        String::from_utf8_lossy(&mod_help.stdout).contains("include_toolchain_registrations");
+    with_registrations && {
+        let probe = std::process::Command::new(bazel())
+            .current_dir(root)
+            .args(["query", "set()", "--proto:possible_toolchain_types"])
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success()
+                || String::from_utf8_lossy(&probe.stderr).contains("Unrecognized option")
+        );
+        probe.status.success()
+    }
+}
+
+#[test]
+fn coarse_external_inputs_remain_unfetched_until_built() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("fine_grained_hub_by_canonical_name");
+    let root = workspace.path();
+    let set_versions = |a: &str, b: &str| {
+        fs::write(
+            root.join("MODULE.bazel"),
+            format!(
+                r#"module(name = "coarse_inputs")
+spoke = use_repo_rule("//:crates.bzl", "spoke")
+spoke(name = "crates__a", version = "{a}")
+spoke(name = "crates__b", version = "{b}")
+"#
+            ),
+        )
+        .unwrap();
+    };
+    set_versions("1.0", "1.0");
+    fs::write(
+        root.join("BUILD.bazel"),
+        r#"
+filegroup(name = "files", srcs = ["@crates__b//:data"])
+genrule(
+    name = "job",
+    srcs = ["@crates__a//:data"],
+    outs = ["job.txt"],
+    cmd = "cat $< > $@",
+)
+genrule(
+    name = "copy",
+    srcs = [":job", ":files"],
+    outs = ["pair.txt"],
+    cmd = "cat $(location :job) $(location :files) > $@",
+)
+"#,
+    )
+    .unwrap();
+
+    let fetched = || {
+        ["@crates__a//:data", "@crates__b//:data"].map(|label| {
+            std::process::Command::new(bazel())
+                .current_dir(root)
+                .args(["query", "--nofetch", label])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        })
+    };
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |name: &str| {
+        let path = out.path().join(format!("{name}.json"));
+        let result = generate(root, &path, &[]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        path
+    };
+    assert_eq!(fetched(), [false, false]);
+    let before = snapshot("before");
+    assert_eq!(
+        fetched(),
+        [false, false],
+        "ordinary hashing fetched a data repository"
+    );
+    assert_product(root, "//:copy", "pair.txt", "1.01.0");
+    assert_eq!(fetched(), [true, true]);
+
+    for (a, b, expected, changed, stable) in [
+        ("2.0", "1.0", "2.01.0", "//:job", "//:files"),
+        ("1.0", "2.0", "1.02.0", "//:files", "//:job"),
+    ] {
+        set_versions(a, b);
+        let after = snapshot("after");
+        assert_product(root, "//:copy", "pair.txt", expected);
+        let impacted_file = out.path().join("impacted.txt");
+        assert!(impacted(root, &before, &after, &impacted_file, &[])
+            .status
+            .success());
+        let labels = read_lines(&impacted_file);
+        let has = |name| {
+            labels
+                .iter()
+                .any(|label| label.trim_start_matches('@') == name)
+        };
+        assert!(has("//:copy"), "{labels:?}");
+        assert!(has(changed), "{labels:?}");
+        assert!(!has(stable), "{labels:?}");
+    }
+}
+
+#[test]
+fn fine_filegroups_can_reveal_the_first_toolchain_readers() {
+    let workspace = copy_workspace("extension_spokes_through_owner");
+    let root = workspace.path();
+    if !supports_module_toolchain_inputs(root) {
+        return;
+    }
+    edit(&root.join("ext/crates.bzl"), |text| {
+        text.replace(
+            r#"load("@ext//:defs.bzl", "crate")"#,
+            r#"load("@ext//:sdk_reader.bzl", crate = "sdk_reader")"#,
+        )
+        .replace(
+            r#"alias(name = "{0}", actual = "@crates__{0}//:lib","#,
+            r#"filegroup(name = "{0}", srcs = ["@crates__{0}//:lib"],"#,
+        )
+    });
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!("{text}\nregister_toolchains(\"//:registered\")\n")
+    });
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!(
+            r#"load("@ext//:sdk_reader.bzl", "sdk")
+{text}
+toolchain_type(name = "sdk_type", visibility = ["//visibility:public"])
+sdk(name = "compiler", data = "sdk.txt")
+toolchain(name = "registered", toolchain_type = ":sdk_type", toolchain = ":compiler")
+genrule(
+    name = "products",
+    srcs = [":uses_a", ":uses_b"],
+    outs = ["products.txt"],
+    cmd = "cat $(location :uses_a) $(location :uses_b) > $@",
+)
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |version: &str| {
+        fs::write(root.join("sdk.txt"), version).unwrap();
+        assert_product(root, "//:products", "products.txt", &version.repeat(2));
+        let hashes = out.path().join(format!("{version}.json"));
+        let edges = out.path().join("edges.json");
+        let run = generate(
+            root,
+            &hashes,
+            &[
+                "--fineGrainedHashExternalRepos=@crates",
+                "-d",
+                edges.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(&hashes).unwrap()).unwrap();
+        assert_eq!(data["metadata"]["moduleToolchainInputs"], true);
+        let edges: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_slice(&fs::read(edges).unwrap()).unwrap();
+        for library in [
+            "@@ext++crates+crates__a//:lib",
+            "@@ext++crates+crates__b//:lib",
+        ] {
+            assert!(
+                edges[library]
+                    .iter()
+                    .any(|input| input.trim_start_matches('@') == "//:registered"),
+                "{library}: {:?}",
+                edges[library]
+            );
+        }
+        hashes
+    };
+    let before = snapshot("1");
+    let after = snapshot("2");
+    let path = out.path().join("impacted.txt");
+    assert!(impacted(root, &before, &after, &path, &[]).status.success());
+    let selected = read_lines(&path);
+    for product in ["//:uses_a", "//:uses_b", "//:products"] {
+        assert!(
+            selected
+                .iter()
+                .any(|label| label.trim_start_matches('@') == product),
+            "{selected:?}"
+        );
+    }
+}
+
+#[test]
+fn projected_toolchain_follows_a_foreign_filegroup() {
+    let workspace = copy_workspace("extension_repo_patch");
+    let root = workspace.path();
+    if !supports_module_toolchain_inputs(root) {
+        return;
+    }
+    // Only the provider's module can name this repository.
+    edit(&root.join("sdk_rules/MODULE.bazel"), |module| {
+        format!(
+            r#"{module}
+sdk_files = use_repo_rule("//:extensions.bzl", "sdk_files")
+sdk_files(name = "sdk_files")
+"#
+        )
+    });
+    edit(&root.join("sdk_rules/BUILD"), |build| {
+        build.replace("@default_sdk//:version.txt", "@sdk_files//:version")
+    });
+
+    let out = tempfile::tempdir().unwrap();
+    let snapshot = |name: &str, expected: &str| {
+        assert_product(root, "//:app", "app.txt", expected);
+        let file = out.path().join(format!("{name}.json"));
+        let result = generate(
+            root,
+            &file,
+            &["--bazelCommandOptions=--proto:output_rule_attrs=tags"],
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        file
+    };
+    let before = snapshot("before", "1.0.0-patched");
+    edit(&root.join("patches/sdk.patch"), |patch| {
+        patch.replace("+1.0.0-patched", "+1.0.0-repatched")
+    });
+    let sdk = snapshot("sdk", "1.0.0-repatched");
+    fs::write(root.join("control.txt"), "new control\n").unwrap();
+    let control = snapshot("control", "1.0.0-repatched");
+
+    let result = out.path().join("impacted.txt");
+    for (start, end, changed, stable) in [
+        (&before, &sdk, "//:app", "//:control"),
+        (&sdk, &control, "//:control", "//:app"),
+    ] {
+        assert!(impacted(root, start, end, &result, &[]).status.success());
+        let labels = read_lines(&result);
+        let has = |name| {
+            labels
+                .iter()
+                .any(|label| label.trim_start_matches('@') == name)
+        };
+        assert!(has(changed), "missing {changed} in {labels:?}");
+        assert!(!has(stable), "unexpected {stable} in {labels:?}");
+    }
+}
+
 #[test]
 fn toolchain_declarations_follow_their_implementations() {
     let workspace = copy_workspace("extension_toolchain_through_owner");
@@ -977,18 +1296,78 @@ fn toolchain_declarations_follow_their_implementations() {
     edit(&root.join("MODULE.bazel"), |module| {
         format!("{module}\nregister_toolchains(\"//declaration:registration\")\n")
     });
+    edit(&root.join("ext/BUILD.bazel"), |contents| {
+        format!(
+            r#"{contents}
+alias(name = "held_registration", actual = "@@//declaration:registration", visibility = ["//visibility:public"])
+"#
+        )
+    });
+    // A manual reference to the type is ordinary data, not a request for its tool.
+    edit(&root.join("declaration/BUILD.bazel"), |contents| {
+        let contents = contents.replace(
+            r#"name = "registration","#,
+            r#"name = "registration", visibility = ["//visibility:public"],"#,
+        );
+        format!(
+            "{contents}\nfilegroup(name = \"mentions_type\", srcs = [\"@ext//:toolchain_type\"])\n"
+        )
+    });
+    edit(&root.join("declaration/BUILD.bazel"), |contents| {
+        format!(
+            r#"{contents}
+genrule(
+    name = "holder",
+    srcs = ["@ext//:held_registration", ":choice"],
+    outs = ["holder.txt"],
+    cmd = "printf registered > $@",
+)
+"#
+        )
+    });
+    let typed = supports_module_toolchain_inputs(root);
+    if typed {
+        // An unusable implementation on another platform still has a known native type.
+        edit(&root.join("declaration/BUILD.bazel"), |build| {
+            format!(
+                r#"{build}
+constraint_setting(name = "optional_platform")
+constraint_value(name = "unavailable_platform", constraint_setting = ":optional_platform")
+toolchain(
+    name = "optional_registration",
+    toolchain_type = "@ext//:toolchain_type",
+    toolchain = "@unmapped_provider//:impl",
+    target_compatible_with = [":unavailable_platform"],
+)
+label_flag(name = "opaque_registration", build_setting_default = ":registration")
+"#
+            )
+        });
+        edit(&root.join("MODULE.bazel"), |module| {
+            format!("{module}\nregister_toolchains(\"//declaration:optional_registration\")\n")
+        });
+    }
     let out = tempfile::tempdir().unwrap();
     let before = out.path().join("before.json");
     let after = out.path().join("after.json");
     let edges = out.path().join("edges.json");
     let result = out.path().join("impacted.json");
-    let args = [
+    let mut args = vec![
         "--bazelCommandOptions=--noproto:flatten_selects",
         "--includeTargetType",
         "-d",
         edges.to_str().unwrap(),
     ];
-    for (hashes, value) in [(&before, "before"), (&after, "after")] {
+    if typed {
+        args.push("--bazelCommandOptions=--proto:possible_toolchain_types");
+    }
+    let legacy_before = out.path().join("legacy-before.json");
+    let legacy_after = out.path().join("legacy-after.json");
+    let legacy_edges = out.path().join("legacy-edges.json");
+    let partial_before = out.path().join("partial-before.json");
+    let partial_after = out.path().join("partial-after.json");
+    let partial_edges = out.path().join("partial-edges.json");
+    for (full_output, value) in [(&before, "before"), (&after, "after")] {
         if value == "after" {
             edit(&root.join("declaration/BUILD.bazel"), |text| {
                 text.replace("\"before\"", "\"after\"")
@@ -1000,7 +1379,60 @@ fn toolchain_declarations_follow_their_implementations() {
             "declaration/consumer.txt",
             value,
         );
-        assert!(generate(root, hashes, &args).status.success());
+        assert!(generate(root, full_output, &args).status.success());
+        if typed {
+            let mut legacy_args = args.clone();
+            legacy_args
+                .retain(|arg| *arg != "--bazelCommandOptions=--proto:possible_toolchain_types");
+            legacy_args[3] = legacy_edges.to_str().unwrap();
+            legacy_args.push("--bazelCommandOptions=--noproto:possible_toolchain_types");
+            let output = if value == "before" {
+                &legacy_before
+            } else {
+                &legacy_after
+            };
+            assert!(generate(root, output, &legacy_args).status.success());
+            let legacy: serde_json::Value =
+                serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+            assert!(!legacy["metadata"]["moduleToolchainInputs"]
+                .as_bool()
+                .unwrap_or(false));
+            assert_product(
+                root,
+                "//declaration:holder",
+                "declaration/holder.txt",
+                "registered",
+            );
+            let mut partial_args = args.clone();
+            partial_args[3] = partial_edges.to_str().unwrap();
+            partial_args.push("--partialGraph");
+            let output = if value == "before" {
+                init_git(root);
+                &partial_before
+            } else {
+                partial_args.extend(["--baseHashes", partial_before.to_str().unwrap()]);
+                &partial_after
+            };
+            let generation = generate(root, output, &partial_args);
+            assert!(
+                generation.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generation.stderr)
+            );
+            if value == "before" {
+                let full = dep_edges(&edges);
+                let partial = dep_edges(&partial_edges);
+                let alias = full["//declaration:holder"]
+                    .iter()
+                    .find(|label| label.ends_with("//:held_registration"))
+                    .expect("the returned external registration alias");
+                assert!(full[alias]
+                    .iter()
+                    .any(|dep| dep.trim_start_matches('@') == "//declaration:registration"));
+                assert!(partial["//declaration:holder"].contains(alias));
+                assert_eq!(partial[alias], full[alias]);
+            }
+        }
     }
     assert!(impacted(
         root,
@@ -1012,7 +1444,7 @@ fn toolchain_declarations_follow_their_implementations() {
     .status
     .success());
     let changes: Vec<serde_json::Value> =
-        serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
     let distance = |name: &str| {
         changes
             .iter()
@@ -1023,7 +1455,198 @@ fn toolchain_declarations_follow_their_implementations() {
     assert_eq!(distance("//declaration:registration"), Some(1));
     assert_eq!(distance("//declaration:choice"), Some(1));
     assert_eq!(distance("//declaration:other"), None);
-    assert!(dep_edges(&edges)["//declaration:choice"].contains("//declaration:other"));
+    if !typed {
+        assert!(dep_edges(&edges)["//declaration:choice"].contains("//declaration:other"));
+    }
+
+    if typed {
+        // A consumer must compare two endpoints produced by the same model.
+        let mismatch = impacted(root, &legacy_before, &after, &result, &[]);
+        assert!(!mismatch.status.success());
+        assert!(String::from_utf8_lossy(&mismatch.stderr)
+            .contains("different MODULE toolchain input modes"));
+        assert!(impacted(
+            root,
+            &legacy_before,
+            &legacy_after,
+            &result,
+            &["-d", legacy_edges.to_str().unwrap()]
+        )
+        .status
+        .success());
+        let legacy: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        assert!(legacy
+            .iter()
+            .any(|row| row["label"] == "//declaration:registration" && row["targetDistance"] == 1));
+        for (start, end, file) in [
+            (&before, &after, &edges),
+            (&partial_before, &partial_after, &partial_edges),
+        ] {
+            let left = hashes(start);
+            let right = hashes(end);
+            assert_eq!(
+                left["//declaration:holder"], right["//declaration:holder"],
+                "an ordinary holder reads only its declarations"
+            );
+            assert_eq!(
+                left["//declaration:registration"],
+                right["//declaration:registration"]
+            );
+            assert_eq!(left["//declaration:choice"], right["//declaration:choice"]);
+            assert_ne!(
+                left["//declaration:consumer"],
+                right["//declaration:consumer"]
+            );
+            let graph = dep_edges(file);
+            let alias = graph["//declaration:holder"]
+                .iter()
+                .find(|name| name.ends_with("//:held_registration"))
+                .expect("the ordinary holder's alias");
+            assert_eq!(
+                left[alias], right[alias],
+                "the alias binding did not change"
+            );
+            assert!(graph["//declaration:consumer"].contains("//declaration:primary"));
+            assert!(!graph["//declaration:registration"].contains("//declaration:primary"));
+            assert!(!graph["//declaration:choice"].contains("//declaration:other"));
+            let saved: serde_json::Value = serde_json::from_slice(&fs::read(end).unwrap()).unwrap();
+            assert_eq!(saved["metadata"]["moduleToolchainInputs"], true);
+            let alternatives = saved["metadata"]["toolchainImplementations"]
+                ["//declaration:choice"]
+                .as_array()
+                .unwrap();
+            assert!(alternatives
+                .iter()
+                .any(|label| label == "//declaration:other"));
+            assert!(
+                impacted(root, start, end, &result, &["-d", file.to_str().unwrap()])
+                    .status
+                    .success()
+            );
+            let reported: Vec<serde_json::Value> =
+                serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+            for declaration in ["//declaration:registration", "//declaration:choice"] {
+                let row = reported
+                    .iter()
+                    .find(|row| row["label"] == declaration)
+                    .unwrap();
+                assert_eq!(row["targetDistance"], 1);
+                assert_eq!(row["packageDistance"], 0);
+            }
+            assert!(!reported
+                .iter()
+                .any(|row| row["label"] == "//declaration:holder"));
+        }
+        let graph = dep_edges(&edges);
+        let consumer = &graph["//declaration:consumer"];
+        assert!(consumer.contains("//declaration:registration"));
+        assert!(!consumer.contains("//declaration:choice"));
+        assert!(!graph["//declaration:mentions_type"].contains("//declaration:registration"));
+        assert_eq!(distance("//declaration:consumer"), Some(1));
+        assert_eq!(distance("//declaration:mentions_type"), None);
+        // Swap only the two MODULE priorities. Both implementation values already
+        // exist in the ordinary graph, and this change is transitive to the reader.
+        edit(&root.join("declaration/BUILD.bazel"), |source| {
+            format!(
+            "{source}\ntoolchain(name=\"alternative_registration\", toolchain=\":other\", toolchain_type=\"@ext//:toolchain_type\")\n")
+        });
+        let module = root.join("MODULE.bazel");
+        let prefix = fs::read_to_string(&module).unwrap();
+        let original = "register_toolchains(\"//declaration:registration\")";
+        assert!(prefix.contains(original));
+        let mut order_rows = Vec::new();
+        for (name, pair, value) in [
+            (
+                "first",
+                ["registration", "alternative_registration"],
+                "after",
+            ),
+            (
+                "second",
+                ["alternative_registration", "registration"],
+                "other",
+            ),
+        ] {
+            fs::write(
+                &module,
+                prefix.replace(
+                    original,
+                    &format!(
+                        "register_toolchains(\"//declaration:{}\", \"//declaration:{}\")",
+                        pair[0], pair[1]
+                    ),
+                ),
+            )
+            .unwrap();
+            assert_product(
+                root,
+                "//declaration:consumer",
+                "declaration/consumer.txt",
+                value,
+            );
+            let file = out.path().join(name);
+            let generation = generate(root, &file, &args);
+            assert!(
+                generation.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generation.stderr)
+            );
+            order_rows.push(file);
+        }
+        let left = hashes(&order_rows[0]);
+        let right = hashes(&order_rows[1]);
+        let reader = "//declaration:consumer";
+        assert_ne!(left[reader], right[reader]);
+        assert_eq!(
+            left[reader].rsplit_once('~').unwrap().1,
+            right[reader].rsplit_once('~').unwrap().1
+        );
+        let graph = dep_edges(&edges);
+        let priority: Vec<_> = graph[reader]
+            .iter()
+            .filter(|l| l.starts_with("//external:!module-toolchain-priority-"))
+            .collect();
+        assert!(priority.iter().any(|key| left[*key] != right[*key]));
+        assert_eq!(
+            left["//declaration:mentions_type"],
+            right["//declaration:mentions_type"]
+        );
+        assert!(impacted(
+            root,
+            &order_rows[0],
+            &order_rows[1],
+            &result,
+            &["-d", edges.to_str().unwrap()]
+        )
+        .status
+        .success());
+        let impact: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        assert_eq!(
+            impact
+                .iter()
+                .find(|r| r["label"] == reader)
+                .and_then(|r| r["targetDistance"].as_u64()),
+            Some(1)
+        );
+
+        // A registration whose native type cannot be established keeps the legacy model.
+        edit(&module, |module| {
+            format!("{module}\nregister_toolchains(\"//declaration:opaque_registration\")\n")
+        });
+        let opaque = out.path().join("opaque.json");
+        let generation = generate(root, &opaque, &args);
+        assert!(
+            generation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generation.stderr)
+        );
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(opaque).unwrap()).unwrap();
+        assert!(!data["metadata"]["moduleToolchainInputs"]
+            .as_bool()
+            .unwrap_or(false));
+    }
 }
 
 // Module `ext`'s extension generates `@app`, whose rule resolves a toolchain, and the repositories

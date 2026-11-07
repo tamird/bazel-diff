@@ -44,7 +44,7 @@ type DigestBytes = [u8; 32];
 
 /// Bumped when the recipe format or the evaluation formula changes, so an entry an older
 /// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 11;
+pub const RECIPE_VERSION: u32 = 12;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index
@@ -280,6 +280,9 @@ fn decode_digest(value: &str) -> Result<DigestBytes> {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartialRecipes {
+    /// The hash-affecting request options used to generate the recipe.
+    #[serde(default)]
+    pub configuration_fingerprint: String,
     pub version: u32,
     /// Hex digest of the `--seed-filepaths` contents.
     pub seed_hash: String,
@@ -734,6 +737,8 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
+        module_toolchain_inputs: base.module_toolchain_inputs,
+        toolchain_implementations: base.toolchain_implementations.clone(),
         partial: base.partial.clone(),
         tree: tree.id().map(str::to_owned),
     })
@@ -1477,6 +1482,11 @@ mod tests {
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
+            module_toolchain_inputs: true,
+            toolchain_implementations: BTreeMap::from([(
+                "//pkg:lib".into(),
+                vec!["//pkg:bin".into()],
+            )]),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),
             partial: Some(recipes),
             tree: None,
@@ -1484,6 +1494,11 @@ mod tests {
         let mut edited = fixture_tree().with_id("edited-tree");
         edited.entries.get_mut("other/c.txt").unwrap().object = "c2".into();
         let derived = derive(&base, &edited).unwrap();
+        assert_eq!(
+            derived.toolchain_implementations,
+            base.toolchain_implementations
+        );
+        assert!(derived.module_toolchain_inputs);
         assert_eq!(derived.module_graph_json.as_deref(), Some("{}"));
         assert_eq!(derived.dependency_fingerprint.as_deref(), Some("fp"));
         assert_eq!(derived.dep_edges, base.dep_edges);
@@ -1497,6 +1512,36 @@ mod tests {
             derived.hashes["//pkg:bin"].hash,
             base.hashes["//pkg:bin"].hash
         );
+        // A source-only Git derivation reevaluates the implementation but keeps the
+        // structural declaration stable. Native reporting can still name that declaration.
+        let mut changed_source = fixture_tree();
+        changed_source.entries.get_mut("pkg/b.txt").unwrap().object = "new-b".into();
+        let rebuilt = derive(&base, &changed_source).unwrap();
+        assert_ne!(
+            rebuilt.hashes["//pkg:bin"].hash,
+            base.hashes["//pkg:bin"].hash
+        );
+        assert_eq!(
+            rebuilt.hashes["//pkg:lib"].hash,
+            base.hashes["//pkg:lib"].hash
+        );
+        let reported = crate::model::impacted_with_terminal_distances(
+            &base.hashes,
+            &rebuilt.hashes,
+            &rebuilt.dep_edges,
+            &rebuilt.toolchain_implementations,
+            None,
+            false,
+        )
+        .unwrap();
+        let distance = |name: &str| {
+            reported
+                .iter()
+                .find(|row| row.label == name)
+                .unwrap()
+                .target_distance
+        };
+        assert_eq!(distance("//pkg:lib"), distance("//pkg:bin") + 1);
         let same = derive(&base, &fixture_tree()).unwrap();
         assert_eq!(same.hashes, base.hashes);
         assert_eq!(same.tree, None);

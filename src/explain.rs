@@ -155,12 +155,59 @@ pub fn explain(
     target: &str,
     limits: ExplainLimits,
 ) -> Result<ExplainOutcome, UnknownTargetError> {
+    explain_with_implementations(from, to, dep_edges, &[], target, limits)
+}
+
+struct ExplanationEdges<'a> {
+    edges: &'a BTreeMap<String, Vec<String>>,
+    target: &'a str,
+    target_inputs: std::borrow::Cow<'a, [String]>,
+}
+
+impl ExplanationEdges<'_> {
+    fn inputs(&self, label: &str) -> &[String] {
+        if label == self.target {
+            &self.target_inputs
+        } else {
+            self.edges.get(label).map(Vec::as_slice).unwrap_or_default()
+        }
+    }
+}
+
+pub fn explain_with_implementations(
+    from: &BTreeMap<String, TargetHash>,
+    to: &BTreeMap<String, TargetHash>,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    implementations: &[String],
+    target: &str,
+    limits: ExplainLimits,
+) -> Result<ExplainOutcome, UnknownTargetError> {
     if !to.contains_key(target) && !from.contains_key(target) {
         return Err(UnknownTargetError(target.to_owned()));
     }
 
     let target_type = type_of(target, to, from);
-    let impacted = impacted_types(from, to);
+    let mut impacted = impacted_types(from, to);
+    if implementations
+        .iter()
+        .any(|body| impacted.contains_key(body))
+    {
+        impacted
+            .entry(target.to_owned())
+            .or_insert(ImpactType::Indirect);
+    }
+    let ordinary = dep_edges.get(target).map(Vec::as_slice).unwrap_or_default();
+    let mut target_inputs = std::borrow::Cow::Borrowed(ordinary);
+    for body in implementations {
+        if !target_inputs.contains(body) {
+            target_inputs.to_mut().push(body.clone());
+        }
+    }
+    let edges = ExplanationEdges {
+        edges: dep_edges,
+        target,
+        target_inputs,
+    };
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
 
@@ -184,7 +231,7 @@ pub fn explain(
     }
 
     let (distances, parents, truncated_by_depth) =
-        walk_upstream(target, dep_edges, &impacted, limits.max_depth);
+        walk_upstream(target, &edges, &impacted, limits.max_depth);
     if truncated_by_depth {
         warnings.push(format!(
             "Stopped the search at --maxDepth={} hops above {target}; root causes further \
@@ -235,7 +282,7 @@ pub fn explain(
         all_roots
     };
 
-    let (nodes, edges) = build_subgraph(&kept, target, &distances, &impacted, dep_edges, to, from);
+    let (nodes, edges) = build_subgraph(&kept, target, &distances, &impacted, &edges, to, from);
 
     Ok(ExplainOutcome {
         explanation: ImpactExplanation {
@@ -262,7 +309,7 @@ pub fn explain(
 #[allow(clippy::type_complexity)]
 fn walk_upstream(
     target: &str,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+    dep_edges: &ExplanationEdges<'_>,
     impacted: &HashMap<String, ImpactType>,
     max_depth: Option<usize>,
 ) -> (BTreeMap<String, usize>, HashMap<String, String>, bool) {
@@ -273,7 +320,7 @@ fn walk_upstream(
 
     while let Some(current) = queue.pop_front() {
         let depth = distances[&current];
-        let deps = dep_edges.get(&current).map(Vec::as_slice).unwrap_or(&[]);
+        let deps = dep_edges.inputs(&current);
         if max_depth.is_some_and(|max| depth >= max) {
             if deps
                 .iter()
@@ -316,7 +363,7 @@ fn build_subgraph(
     target: &str,
     distances: &BTreeMap<String, usize>,
     impacted: &HashMap<String, ImpactType>,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+    dep_edges: &ExplanationEdges<'_>,
     to: &BTreeMap<String, TargetHash>,
     from: &BTreeMap<String, TargetHash>,
 ) -> (Vec<ExplainNode>, Vec<ExplainEdge>) {
@@ -354,9 +401,7 @@ fn build_subgraph(
         .iter()
         .flat_map(|consumer| {
             dep_edges
-                .get(consumer)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+                .inputs(consumer)
                 .iter()
                 .filter(|dep| included.contains(*dep))
                 .map(|dep| ExplainEdge {

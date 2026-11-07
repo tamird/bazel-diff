@@ -124,6 +124,16 @@ bazel-diff get-impacted-targets --startingHashes main_hashes.json --finalHashes 
 
 The [query service](#query-service) runs the same derivation server-side behind a cache.
 
+### Comparing toolchain inputs
+
+When ordinary query uses Bazel's declared toolchain types and MODULE registration data, the hash file records `metadata.moduleToolchainInputs: true`. A missing field means `false` (legacy mode). Compare this value before comparing raw hashes or dependency edges; both revisions must use the same value even when their Bazel versions match. The CLI and query service reject mismatched modes.
+
+On a producer that supports the option, `--bazelCommandOptions=--noproto:possible_toolchain_types` selects legacy mode. Use it for both generations when comparing legacy results, or regenerate both with a common supported producer. Offline `--baseHashes` reuse keeps the mode recorded with the base.
+
+When `moduleToolchainInputs` is true, a declaration's raw hash and dependency edges retain its ordinary inputs and implementation binding. Typed readers have their own possible implementation dependencies. If a rule names a local declaration and its dependencies may contain a reader of that type, the rule can still be selected conservatively. `metadata.toolchainImplementations` stores relationships from declarations to implementations. `get-impacted-targets` and the query service use them to report a declaration after computing ordinary impacts. A declaration can therefore appear in CLI results while its raw hash stays stable. `explain` consults these relationships when explaining that declaration.
+
+External caches should distinguish the producer and request. A live dependency fingerprint describes producer capability and enrollment; a tolerated discovery failure can still produce a legacy result. Use the actual mode stored with each cached result.
+
 ## Build Graph Distance Metrics
 
 `bazel-diff` can optionally compute build graph distance metrics between two revisions. This is

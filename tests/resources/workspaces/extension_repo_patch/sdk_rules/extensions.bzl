@@ -34,3 +34,12 @@ sdk = module_extension(
         }),
     },
 )
+
+def _sdk_files_impl(rctx):
+    rctx.file(
+        "BUILD.bazel",
+        'filegroup(name = "version", srcs = [%r], visibility = ["//visibility:public"])\n' %
+        str(Label("@default_sdk//:version.txt")),
+    )
+
+sdk_files = repository_rule(implementation = _sdk_files_impl)

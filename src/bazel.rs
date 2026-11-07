@@ -20,6 +20,21 @@ use tempfile::NamedTempFile;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BazelVersion(u32, u32, u32);
 
+#[derive(Debug)]
+struct QueryFailure {
+    code: i32,
+    stderr: String,
+}
+
+impl std::fmt::Display for QueryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { code, stderr } = self;
+        write!(formatter, "Bazel query failed, exit code {code}: {stderr}")
+    }
+}
+
+impl std::error::Error for QueryFailure {}
+
 /// The flag that decides whether the `//external` package exists.
 const WORKSPACE_FLAG: &str = "enable_workspace";
 
@@ -247,7 +262,13 @@ impl BazelOptions {
         }
 
         hasher.update(b"mode:bzlmod\0");
-        let module_graph = self.module_graph_json().unwrap_or_default();
+        let module_graph = match self.online_registration_graph()? {
+            Some(graph) => {
+                hasher.update(b"moduleToolchainInputs=1\0");
+                graph
+            }
+            None => self.module_graph_json().unwrap_or_default(),
+        };
         hasher.update(module_graph.as_bytes());
         hasher.update(b"\0");
 
@@ -278,6 +299,50 @@ impl BazelOptions {
             canonical_names.len(),
         );
         Ok(hex::encode(hasher.finalize()))
+    }
+
+    // The online cache guard can also identify a same-version Bazel with an upgraded
+    // query formatter. Offline tree derivation uses the mode recorded with its own graph.
+    fn online_registration_graph(&self) -> Result<Option<String>> {
+        if self.use_cquery
+            || self.isolated_dependency_root.is_some()
+            || self.exclude_targets_query.is_some()
+            || !self.label_only_module_extensions.is_empty()
+            || self.module_toolchain_query()?.is_none()
+        {
+            return Ok(None);
+        }
+        let answer = self.run_capture(&[
+            "mod",
+            "graph",
+            "--output=json",
+            "--include_toolchain_registrations",
+        ])?;
+        Self::check_observation_status(&answer)?;
+        if !answer.status.success() {
+            bail!(
+                "Bazel could not fingerprint its MODULE toolchain registrations: {}",
+                String::from_utf8_lossy(&answer.stderr)
+            );
+        }
+        #[derive(serde::Deserialize)]
+        struct RegistrationList {
+            #[serde(rename = "moduleToolchainRegistrations")]
+            _labels: Vec<String>,
+        }
+        serde_json::from_slice::<RegistrationList>(&answer.stdout)
+            .context("Bazel returned an incomplete MODULE toolchain registration fingerprint")?;
+        Ok(Some(String::from_utf8(answer.stdout)?.trim().to_owned()))
+    }
+
+    /// Producer contribution to the explicit one-shot fingerprint.
+    pub fn toolchain_producer_fingerprint(&self) -> Result<Option<String>> {
+        if !self.is_bzlmod_enabled() {
+            return Ok(None);
+        }
+        Ok(self
+            .online_registration_graph()?
+            .map(|graph| hex::encode(Sha256::digest(graph.as_bytes()))))
     }
 
     /// Asks Bazel for its release, output base and Starlark semantics in one invocation. `None`
@@ -447,6 +512,346 @@ impl BazelOptions {
                 );
             }
         }
+        // A configured query already carries its selected providers. The explicit
+        // isolated-root mode owns its existing query scope.
+        let query_options = if bzlmod_enabled
+            && supports_bzlmod
+            && !self.use_cquery
+            && self.isolated_dependency_root.is_none()
+            && self.label_only_module_extensions.is_empty()
+            && self.exclude_targets_query.is_none()
+            && root_mapping.is_some()
+        {
+            self.module_toolchain_query()?
+        } else {
+            None
+        };
+        let mut observed = None;
+        let mut terminal = TerminalToolchains::default();
+        let mut coarse_references = BTreeMap::<String, BTreeSet<String>>::new();
+        if let Some(query) = &query_options {
+            'observation: {
+                let mut strict = query.clone();
+                strict.keep_going = false;
+                strict.command_options.push("--nokeep_going".into());
+                let primary_read = strict.collect_all_targets(
+                    Vec::new(),
+                    server_info.external_package,
+                    |expression, use_cquery| {
+                        strict.query_with(expression, use_cquery, version, &mut |batch| {
+                            transform(batch, None)
+                        })
+                    },
+                );
+                let Some(mut primary) = self.optional_query_result(primary_read)? else {
+                    break 'observation;
+                };
+                let primary_len = primary.len();
+                if !self.fine_grained_external_repos.is_empty() {
+                    query.acquire_alias_inputs(
+                        &mut primary,
+                        root_mapping.as_deref(),
+                        version,
+                        &mut transform,
+                    )?;
+                }
+                let mapping = root_mapping
+                    .as_deref()
+                    .map(|raw| {
+                        crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw))
+                    })
+                    .unwrap_or_default();
+                let mut coarse_candidates = unrepresented_coarse_inputs(
+                    &primary,
+                    primary_len,
+                    &self.fine_grained_external_repos,
+                    &mapping,
+                );
+                let mut unknown = BTreeMap::<String, BTreeSet<String>>::new();
+                let mut provider_packages = ProviderPackages::default();
+                let roles = primary
+                    .iter()
+                    .filter_map(|row| row.rule.as_option())
+                    .filter_map(|rule| rule.possible_toolchain_types.as_option());
+                let registrations = if roles.clone().next().is_none() {
+                    None
+                } else if has_toolchain_demand(&primary) {
+                    self.query_module_registrations()?
+                        .map(|registrations| (registrations, true))
+                } else {
+                    // A typed-empty graph can still report a local declaration as a terminal.
+                    Some((Vec::new(), false))
+                };
+                let mut precise = false;
+                if let Some((mut registrations, mut registrations_read)) = registrations {
+                    let mut queried_bodies = BTreeSet::new();
+                    // A fine traversal can introduce the first typed rule after an empty primary.
+                    let mut demand_cursor = primary.len();
+                    // Original ordinary rows keep their coarse scope. Only appended rows and
+                    // observed resolution roots seed supplemental discovery.
+                    let mut ordinary_cursor = primary.len();
+                    'discovery: loop {
+                        if !registrations_read {
+                            let has_demand = has_toolchain_demand(&primary[demand_cursor..]);
+                            demand_cursor = primary.len();
+                            if has_demand {
+                                let Some(labels) = self.query_module_registrations()? else {
+                                    break 'observation;
+                                };
+                                registrations = labels;
+                                registrations_read = true;
+                            }
+                        }
+                        let joined = query.connect_module_toolchains(
+                            &mut primary,
+                            &registrations,
+                            root_mapping.as_deref(),
+                            version,
+                            &mut provider_packages,
+                            &mut transform,
+                        );
+                        let Some(mut inputs) = self.optional_query_result(joined)? else {
+                            break 'observation;
+                        };
+                        if !inputs.complete {
+                            break 'observation;
+                        }
+                        if !registrations_read && has_toolchain_demand(&primary[demand_cursor..]) {
+                            continue;
+                        }
+                        let mut resolution_roots = inputs.resolution_roots.clone();
+                        let catalog_end = primary.len();
+                        let new_bodies = inputs
+                            .unique_bodies
+                            .iter()
+                            .filter(|label| queried_bodies.insert((*label).clone()))
+                            .cloned()
+                            .collect();
+                        let literals = query.acquire_unique_provider_inputs(
+                            &mut primary,
+                            &new_bodies,
+                            root_mapping.as_deref(),
+                            version,
+                            &mut transform,
+                        );
+                        if self.optional_query_result(literals)?.is_none() {
+                            break 'observation;
+                        }
+                        query.acquire_named_module_inputs(
+                            &mut primary,
+                            OrdinaryInputRoots {
+                                start: ordinary_cursor,
+                                named: &resolution_roots,
+                            },
+                            root_mapping.as_deref(),
+                            version,
+                            &mut transform,
+                            &mut unknown,
+                        )?;
+                        ordinary_cursor = primary.len();
+                        if primary.len() != catalog_end {
+                            // New ordinary rows can change provider availability or reader types.
+                            continue;
+                        }
+                        loop {
+                            for row in &primary {
+                                let Some(rule) = row.rule.as_option() else {
+                                    continue;
+                                };
+                                let name = canonical_query_label(&rule.name, &mapping);
+                                if let Some(declaration) = inputs.declarations.get(name.as_ref()) {
+                                    coarse_candidates
+                                        .entry(rule.name.clone())
+                                        .or_default()
+                                        .extend(declaration.ordinary.iter().cloned());
+                                }
+                            }
+                            let returned: HashSet<_> = primary
+                                .iter()
+                                .filter_map(target_name)
+                                .filter_map(|label| {
+                                    let key = canonical_query_label(label, &mapping);
+                                    canonical_query_repo(&key)
+                                        .is_some()
+                                        .then(|| key.into_owned())
+                                })
+                                .collect();
+                            let fine = FineQueryRows::new(
+                                &self.fine_grained_external_repos,
+                                &primary,
+                                &mapping,
+                            );
+                            let candidates = eligible_coarse_inputs(
+                                &coarse_candidates,
+                                &primary,
+                                &fine,
+                                &resolution_roots,
+                                &mapping,
+                                &returned,
+                                &inputs.closed_types,
+                            )
+                            .into_values()
+                            .flatten()
+                            .collect();
+                            let endpoints = primary
+                                .iter()
+                                .filter_map(target_name)
+                                .filter_map(|label| {
+                                    let key = canonical_query_label(label, &mapping);
+                                    (inputs.closed_types.contains(key.as_ref())
+                                        || inputs.closed_registrations.contains(key.as_ref()))
+                                    .then(|| key.into_owned())
+                                })
+                                .collect();
+                            let aliases = query.query_registration_aliases(
+                                &candidates,
+                                &inputs.registration_paths,
+                                &endpoints,
+                                &mapping,
+                                version,
+                            );
+                            let alias_start = primary.len();
+                            if let Some(mut rows) = self.optional_query_result(aliases)? {
+                                retain_supplemental_targets(&mut rows, &primary);
+                                if !rows.is_empty() {
+                                    inputs.record_registration_aliases(&rows, &mapping);
+                                    transform(&mut rows, None);
+                                    primary.extend(rows);
+                                }
+                            }
+                            if primary.len() != alias_start {
+                                let alias_end = primary.len();
+                                query.acquire_named_module_inputs(
+                                    &mut primary,
+                                    OrdinaryInputRoots {
+                                        start: ordinary_cursor,
+                                        named: &resolution_roots,
+                                    },
+                                    root_mapping.as_deref(),
+                                    version,
+                                    &mut transform,
+                                    &mut unknown,
+                                )?;
+                                ordinary_cursor = primary.len();
+                                if primary.len() != alias_end {
+                                    continue 'discovery;
+                                }
+                                continue;
+                            }
+                            let local_start = primary.len();
+                            let local = query.local_toolchain_inputs(
+                                &mut primary,
+                                &inputs,
+                                &mapping,
+                                version,
+                                &mut transform,
+                            );
+                            let Some(local) = self.optional_query_result(local)? else {
+                                break 'observation;
+                            };
+                            if primary.len() != local_start {
+                                continue 'discovery;
+                            }
+                            let root_count = resolution_roots.len();
+                            resolution_roots.extend(local.resolution_roots);
+                            if resolution_roots.len() != root_count {
+                                let before = primary.len();
+                                query.acquire_named_module_inputs(
+                                    &mut primary,
+                                    OrdinaryInputRoots {
+                                        start: ordinary_cursor,
+                                        named: &resolution_roots,
+                                    },
+                                    root_mapping.as_deref(),
+                                    version,
+                                    &mut transform,
+                                    &mut unknown,
+                                )?;
+                                ordinary_cursor = primary.len();
+                                if primary.len() != before {
+                                    continue 'discovery;
+                                }
+                                continue;
+                            }
+                            let (projected, missing) =
+                                inputs.project(&mut primary, local.referrers, &mapping);
+                            terminal = projected;
+                            for (reader, bodies) in missing {
+                                unknown.entry(reader).or_default().extend(bodies);
+                            }
+                            Self::attach_registration_order(
+                                &mut primary,
+                                &inputs.families,
+                                root_mapping.as_deref(),
+                                &mut transform,
+                            );
+                            let returned: HashSet<_> = primary
+                                .iter()
+                                .filter_map(target_name)
+                                .filter_map(|label| {
+                                    let key = canonical_query_label(label, &mapping);
+                                    canonical_query_repo(&key)
+                                        .is_some()
+                                        .then(|| key.into_owned())
+                                })
+                                .collect();
+                            let fine = FineQueryRows::new(
+                                &self.fine_grained_external_repos,
+                                &primary,
+                                &mapping,
+                            );
+                            for (owner, labels) in eligible_coarse_inputs(
+                                &coarse_candidates,
+                                &primary,
+                                &fine,
+                                &resolution_roots,
+                                &mapping,
+                                &returned,
+                                &inputs.closed_types,
+                            ) {
+                                let repos: BTreeSet<_> = labels
+                                    .iter()
+                                    .filter_map(|label| {
+                                        canonical_query_repo(label).map(str::to_owned)
+                                    })
+                                    .collect();
+                                if !repos.is_empty() {
+                                    survey.coarse_repos.extend(repos.iter().cloned());
+                                    coarse_references.insert(owner, repos);
+                                }
+                            }
+                            for row in &mut primary {
+                                let Some(rule) = row.rule.as_option_mut() else {
+                                    continue;
+                                };
+                                let Some(labels) = unknown.get(&rule.name) else {
+                                    continue;
+                                };
+                                for label in labels {
+                                    let key = canonical_query_label(label, &mapping);
+                                    if returned.contains(key.as_ref()) {
+                                        continue;
+                                    }
+                                    if let Some(repo) = canonical_query_repo(&key) {
+                                        survey.uncertain_repos.insert(repo.to_owned());
+                                        rule.rule_input
+                                            .push(format!("//external:!unobserved-{repo}"));
+                                    }
+                                }
+                            }
+                            precise = true;
+                            break 'discovery;
+                        }
+                    }
+                }
+                survey.precise_toolchain_inputs = precise;
+                observed = Some(primary);
+            }
+        }
+        if !survey.precise_toolchain_inputs {
+            terminal = TerminalToolchains::default();
+        }
+        terminal.precise = survey.precise_toolchain_inputs;
         if bzlmod_enabled && supports_bzlmod {
             let queried = self.query_bzlmod_repos(root_mapping, survey, &mut |target, inputs| {
                 transform(std::slice::from_mut(target), inputs);
@@ -477,27 +882,59 @@ impl BazelOptions {
             ..self.clone()
         });
         let mut loads = BTreeMap::new();
-        let mut targets = self.collect_all_targets(
-            bzlmod_repos,
-            server_info.external_package,
-            |expression, use_cquery| {
-                if let Some(strict) = &strict {
-                    strict.query_with(
-                        &self.with_exclude_filter(scope.expression(expression)),
-                        false,
-                        version,
-                        &mut |batch| {
-                            scope.record_build_loads(batch, &mut loads);
-                            transform(batch, None);
-                        },
-                    )
-                } else {
-                    self.query_with(expression, use_cquery, version, &mut |batch| {
-                        transform(batch, None)
-                    })
+        let reused_primary = observed.is_some();
+        let mut targets = if let Some(mut primary) = observed {
+            {
+                let available: HashSet<_> = bzlmod_repos
+                    .iter()
+                    .filter_map(target_name)
+                    .filter(|name| name.starts_with("//external:!coarse-"))
+                    .collect();
+                for row in &mut primary {
+                    let Some(rule) = row.rule.as_option_mut() else {
+                        continue;
+                    };
+                    if let Some(repos) = coarse_references.get(&rule.name) {
+                        for repo in repos {
+                            let name = format!("//external:!coarse-{repo}");
+                            if available.contains(name.as_str()) && !rule.rule_input.contains(&name)
+                            {
+                                terminal
+                                    .derived
+                                    .entry(rule.name.clone())
+                                    .or_default()
+                                    .insert(name.clone());
+                                rule.rule_input.push(name);
+                            }
+                        }
+                    }
                 }
-            },
-        )?;
+            }
+            primary.extend(bzlmod_repos);
+            deduplicate_targets(primary)?
+        } else {
+            self.collect_all_targets(
+                bzlmod_repos,
+                server_info.external_package,
+                |expression, use_cquery| {
+                    if let Some(strict) = &strict {
+                        strict.query_with(
+                            &self.with_exclude_filter(scope.expression(expression)),
+                            false,
+                            version,
+                            &mut |batch| {
+                                scope.record_build_loads(batch, &mut loads);
+                                transform(batch, None);
+                            },
+                        )
+                    } else {
+                        self.query_with(expression, use_cquery, version, &mut |batch| {
+                            transform(batch, None)
+                        })
+                    }
+                },
+            )?
+        };
         if let Some(strict) = &strict {
             // Direct users may name a target the hub doesn't export. Ask only about
             // edges actually seen in the ordinary graph, and keep the primary's rows.
@@ -541,7 +978,8 @@ impl BazelOptions {
             }
             scope.connect_external_readers(&loads, &mut targets, &coverage)?;
         }
-        if !self.use_cquery
+        if !reused_primary
+            && !self.use_cquery
             && !self.fine_grained_external_repos.is_empty()
             && self.isolated_dependency_root.is_none()
         {
@@ -569,6 +1007,7 @@ impl BazelOptions {
             root_mapping,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
+                terminal,
                 repositories: scope
                     .aliases
                     .into_iter()
@@ -583,6 +1022,1353 @@ impl BazelOptions {
         })
     }
 
+    fn check_observation_status(output: &Output) -> Result<()> {
+        if output.status.code() == Some(8) || output.status.code().is_none() {
+            bail!("Bazel interrupted while reading toolchain metadata");
+        }
+        Ok(())
+    }
+
+    // Both interfaces are optional. A workspace using the old query formatter or an
+    // explicitly different query/module repository mapping keeps the existing owners.
+    fn module_toolchain_query(&self) -> Result<Option<Self>> {
+        if self.command_options.iter().any(|arg| {
+            let disabled = [
+                "proto:possible_toolchain_types",
+                "proto:rule_inputs_and_outputs",
+                "proto:rule_classes",
+            ]
+            .iter()
+            .any(|name| {
+                arg == &format!("--no{name}")
+                    || arg.strip_prefix(&format!("--{name}=")).is_some_and(|v| {
+                        matches!(
+                            v.to_ascii_lowercase().as_str(),
+                            "false" | "0" | "no" | "f" | "n"
+                        )
+                    })
+            });
+            disabled
+                || !(arg.starts_with("--proto:")
+                    || arg.starts_with("--noproto:")
+                    || arg.starts_with("--curses=")
+                    || arg.starts_with("--color=")
+                    || matches!(
+                        arg.as_str(),
+                        "--keep_going"
+                            | "--nokeep_going"
+                            | "--consistent_labels"
+                            | "--noshow_progress"
+                    ))
+        }) {
+            return Ok(None);
+        }
+        let help = self.run_capture(&["help", "mod"])?;
+        Self::check_observation_status(&help)?;
+        if !help.status.success()
+            || !String::from_utf8_lossy(&help.stdout).contains("include_toolchain_registrations")
+        {
+            return Ok(None);
+        }
+        let probe = self.run_capture(&["query", "set()", "--proto:possible_toolchain_types"])?;
+        Self::check_observation_status(&probe)?;
+        if !probe.status.success() {
+            return Ok(None);
+        }
+        let mut options = self.clone();
+        options.command_options.extend([
+            "--proto:possible_toolchain_types".into(),
+            "--proto:rule_classes".into(),
+        ]);
+        Ok(Some(options))
+    }
+
+    fn query_module_registrations(&self) -> Result<Option<Vec<String>>> {
+        let output = self.run_capture(&[
+            "mod",
+            "graph",
+            "--output=json",
+            "--include_toolchain_registrations",
+        ])?;
+        Self::check_observation_status(&output)?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        #[derive(serde::Deserialize)]
+        struct Registrations {
+            #[serde(rename = "moduleToolchainRegistrations")]
+            labels: Vec<String>,
+        }
+        Ok(serde_json::from_slice::<Registrations>(&output.stdout)
+            .ok()
+            .map(|registrations| registrations.labels))
+    }
+
+    /// For a required type with one measured MODULE implementation, that body's
+    /// unconditional label inputs are genuine operands. A selectable data attribute
+    /// does not grant permission to materialize its unchosen branches.
+    fn acquire_unique_provider_inputs(
+        &self,
+        targets: &mut Vec<Target>,
+        bodies: &BTreeSet<String>,
+        root_mapping: Option<&[u8]>,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<()> {
+        use crate::proto::blaze_query::attribute::Discriminator;
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        let mapping = root_mapping
+            .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
+            .unwrap_or_default();
+        let canonical =
+            |name: &str| canonical_query_label(main_repo_label_key(name), &mapping).into_owned();
+        let mut strict = self.clone();
+        strict.keep_going = false;
+        strict.command_options.push("--nokeep_going".into());
+        let mut structure = strict.clone();
+        structure.command_options.extend([
+            "--proto:output_rule_attrs=all".into(),
+            "--noproto:flatten_selects".into(),
+            "--consistent_labels".into(),
+        ]);
+        let rows = structure.query_with(
+            &self.with_exclude_filter(query_set(bodies)?),
+            false,
+            version,
+            &mut |_| {},
+        )?;
+        let mut inputs = BTreeSet::new();
+        for row in rows {
+            let Some(rule) = row.rule.as_option() else {
+                continue;
+            };
+            let key = canonical(&rule.name);
+            if !bodies.contains(&key) {
+                continue;
+            }
+            let ordinary: HashSet<_> = rule
+                .rule_input
+                .iter()
+                .map(|input| canonical(input))
+                .collect();
+            for attr in &rule.attribute {
+                if attr.nodep == Some(true)
+                    || attr.selector_list.as_option().is_some()
+                    || !matches!(attr.r#type, Discriminator::Label | Discriminator::LabelList)
+                {
+                    continue;
+                }
+                for input in attr.string_value.iter().chain(&attr.string_list_value) {
+                    let input = canonical(input);
+                    if ordinary.contains(&input) {
+                        inputs.insert(input);
+                    }
+                }
+            }
+        }
+        for name in targets.iter().filter_map(target_name) {
+            inputs.remove(&canonical(name));
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let read = strict.query_with(
+            &self.with_exclude_filter(query_set(&inputs)?),
+            false,
+            version,
+            &mut |_| {},
+        )?;
+        let mut rows = read;
+        retain_supplemental_targets(&mut rows, targets);
+        transform(&mut rows, None);
+        targets.extend(rows);
+        Ok(())
+    }
+
+    /// Inspect existing aliases only in packages already loaded for a demanded type or matching
+    /// registration. Keep literal paths from named ordinary inputs to an already returned type or
+    /// declaration; no alias operand outside the returned table is queried.
+    fn query_registration_aliases(
+        &self,
+        candidates: &BTreeSet<String>,
+        anchors: &BTreeSet<String>,
+        endpoints: &BTreeSet<String>,
+        mapping: &HashMap<String, String>,
+        version: Option<BazelVersion>,
+    ) -> Result<Vec<Target>> {
+        if candidates.is_empty() || endpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let packages: BTreeSet<_> = candidates
+            .iter()
+            .filter_map(|name| name.rsplit_once(':').map(|(package, _)| package))
+            .collect();
+        let mut anchors_by_package = BTreeMap::new();
+        for anchor in anchors {
+            let Some((package, _)) = anchor.rsplit_once(':') else {
+                continue;
+            };
+            if packages.contains(package) && query_labels(std::iter::once(anchor)).is_ok() {
+                anchors_by_package.entry(package).or_insert(anchor);
+            }
+        }
+        if anchors_by_package.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expression = format!(
+            "kind('^alias rule$', {})",
+            query_siblings(anchors_by_package.values().copied())?
+        );
+        let (bindings, _) = self.query_alias_actuals(&expression, version)?;
+        let mut originals = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
+        for (spelling, actual) in bindings {
+            if actual.selector_list.as_option().is_some() {
+                continue;
+            }
+            let Some(child) = actual.string_value.as_deref() else {
+                continue;
+            };
+            let name = canonical_query_label(&spelling, mapping).into_owned();
+            if endpoints.contains(&name)
+                || !name
+                    .rsplit_once(':')
+                    .is_some_and(|(package, _)| anchors_by_package.contains_key(package))
+            {
+                continue;
+            }
+            let child = canonical_query_label(child, mapping).into_owned();
+            aliases.insert(name.clone(), BTreeSet::from([child]));
+            originals.insert(name, (spelling, actual));
+        }
+        let ready = closed_aliases(endpoints.clone(), &aliases, &BTreeSet::new());
+        let retained: BTreeSet<_> = candidates
+            .intersection(&ready)
+            .flat_map(|root| reachable_aliases(root, &aliases))
+            .filter(|name| aliases.contains_key(name))
+            .collect();
+        let bindings = retained
+            .into_iter()
+            .filter_map(|name| originals.remove(&name))
+            .collect();
+        let mut strict = self.clone();
+        strict.keep_going = false;
+        strict.command_options.push("--nokeep_going".into());
+        strict.query_aliases_with_bindings(bindings, version)
+    }
+
+    /// A package inventory can establish that an optional provider name is absent without
+    /// turning it into a mandatory query root. Keep complete inventories across join passes.
+    fn query_optional_provider_packages(
+        &self,
+        candidates: &BTreeSet<String>,
+        fine_repositories: &HashSet<String>,
+        inventory: &mut ProviderPackages,
+        mapping: &HashMap<String, String>,
+        version: Option<BazelVersion>,
+    ) -> Result<Vec<Target>> {
+        let mut packages = BTreeMap::new();
+        for name in candidates {
+            let Some((package, _)) = name.rsplit_once(':') else {
+                continue;
+            };
+            if inventory.complete.contains(package)
+                || canonical_query_repo(name).is_some_and(|repo| fine_repositories.contains(repo))
+            {
+                continue;
+            }
+            let pattern = format!("{package}:all-targets");
+            if query_labels(std::iter::once(&pattern)).is_ok() {
+                packages.entry(package.to_owned()).or_insert(pattern);
+            }
+        }
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut strict = self.clone();
+        strict.keep_going = false;
+        strict.command_options.push("--nokeep_going".into());
+        // A literal all-targets target can shadow the wildcard. Its siblings still give the
+        // complete package, as do the siblings of an unshadowed wildcard expansion.
+        let rows = strict.query_with(
+            &self.with_exclude_filter(query_siblings(packages.values())?),
+            false,
+            version,
+            &mut |_| {},
+        )?;
+        let mut names = BTreeSet::new();
+        let mut retained = Vec::new();
+        for row in rows {
+            let Some(name) = target_name(&row) else {
+                continue;
+            };
+            let name = canonical_query_label(name, mapping).into_owned();
+            if !name
+                .rsplit_once(':')
+                .is_some_and(|(package, _)| packages.contains_key(package))
+            {
+                continue;
+            }
+            names.insert(name.clone());
+            if candidates.contains(&name) {
+                retained.push(row);
+            }
+        }
+        inventory.complete.extend(packages.into_keys());
+        inventory.targets.extend(names);
+        Ok(retained)
+    }
+
+    /// MODULE precedence is an input of a reader's toolchain resolution. Sharing
+    /// one configuration row per type keeps a priority-only edit out of the rule's
+    /// direct digest and preserves the cause in normal full and partial graphs.
+    fn attach_registration_order(
+        targets: &mut Vec<Target>,
+        order: &BTreeMap<String, ToolchainFamily>,
+        root_mapping: Option<&[u8]>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) {
+        let mapping = root_mapping
+            .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
+            .unwrap_or_default();
+        let mut nodes = BTreeMap::<String, Target>::new();
+        for row in targets.iter_mut() {
+            let Some(rule) = row.rule.as_option_mut() else {
+                continue;
+            };
+            let Some(types) = rule.possible_toolchain_types.as_option() else {
+                continue;
+            };
+            for ty in &types.label {
+                let key = canonical_query_label(main_repo_label_key(ty), &mapping);
+                let Some(family) = order.get(key.as_ref()) else {
+                    continue;
+                };
+                let node = nodes.entry(key.to_string()).or_insert_with(|| {
+                    // The encoded canonical type is injective, including main-repository labels.
+                    let name =
+                        format!("!module-toolchain-priority-{}", hex::encode(key.as_bytes()));
+                    let binding = Attribute {
+                        name: "module_toolchain_registrations".into(),
+                        r#type: crate::proto::blaze_query::attribute::Discriminator::StringList,
+                        string_list_value: family.registrations.clone(),
+                        ..Default::default()
+                    };
+                    repository_target(
+                        Rule {
+                            rule_class: "toolchain_registration_order".into(),
+                            attribute: vec![binding],
+                            ..Default::default()
+                        },
+                        &name,
+                        &BTreeSet::new(),
+                    )
+                });
+                if let Some(name) = target_name(node) {
+                    rule.rule_input.push(name.to_owned());
+                }
+            }
+        }
+        let mut rows = nodes.into_values().collect::<Vec<_>>();
+        transform(&mut rows, None);
+        targets.extend(rows);
+    }
+
+    /// Follow inputs reached from supplier reads or explicitly requested fine repositories.
+    /// A literal native forwarder can enter an unimported repository. An unopened branch of a
+    /// select stays at its own referrer instead of forcing every branch to load.
+    fn acquire_named_module_inputs(
+        &self,
+        targets: &mut Vec<Target>,
+        roots: OrdinaryInputRoots<'_>,
+        root_mapping: Option<&[u8]>,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+        unknown: &mut BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<()> {
+        let Some(raw) = root_mapping else {
+            return Ok(());
+        };
+        let mapping = crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw));
+        let canonical =
+            |label: &str| canonical_query_label(main_repo_label_key(label), &mapping).into_owned();
+        let mut present: HashSet<_> = targets
+            .iter()
+            .filter_map(target_name)
+            .map(canonical)
+            .collect();
+        let fine = FineQueryRows::new(&self.fine_grained_external_repos, targets, &mapping);
+        let mut visited_fine = HashSet::new();
+        // A supplier join can add an input to an earlier row. Recheck the reached
+        // fine rows even when the join only changed existing rules.
+        let mut reached = fine.reached(targets, targets, roots.named, &mapping, &mut visited_fine);
+        let mut tried = HashSet::new();
+        let mut cursor = roots.start;
+        while cursor < targets.len() || !reached.is_empty() {
+            let end = targets.len();
+            let mut pending = BTreeMap::<String, BTreeSet<String>>::new();
+            let mut forwarders = BTreeMap::new();
+            let outside = targets[cursor..end].iter().filter(|row| {
+                fine.repositories.is_empty()
+                    || target_name(row).is_some_and(|name| !fine.contains(name, &mapping))
+            });
+            for row in outside.chain(reached.drain(..).map(|i| &targets[i])) {
+                let Some(rule) = row.rule.as_option() else {
+                    continue;
+                };
+                // #619 promotes an implementation operand into the declaration's
+                // rule_input. Its admission and uncertainty belong to the typed
+                // provider read, not the ordinary traversal.
+                if rule.rule_class_key.as_deref() == Some("toolchain") {
+                    continue;
+                }
+                let owner = canonical(&rule.name);
+                let mut absent = BTreeSet::new();
+                for input in &rule.rule_input {
+                    if !input.starts_with('@') {
+                        continue;
+                    }
+                    let key = canonical(input);
+                    let Some((repo, _)) = key.strip_prefix("@@").and_then(|s| s.split_once("//"))
+                    else {
+                        continue;
+                    };
+                    // A missing label in the enumerated fine namespace was not a returned root.
+                    if repo.is_empty() || present.contains(&key) || fine.repositories.contains(repo)
+                    {
+                        continue;
+                    }
+                    if matches!(rule.rule_class.as_str(), "alias" | "filegroup") {
+                        absent.insert(key);
+                    } else if key.rsplit_once(':').map(|p| p.0)
+                        == owner.rsplit_once(':').map(|p| p.0)
+                    {
+                        // The source package was reached by a fine or supplier read. Its exact local
+                        // inputs, including a condition's flag, need no new repository namespace.
+                        pending.entry(key).or_default();
+                    }
+                }
+                if !absent.is_empty() {
+                    forwarders.insert(owner, (rule.name.clone(), absent));
+                }
+            }
+
+            if !forwarders.is_empty() {
+                let mut strict = self.clone();
+                strict.keep_going = false;
+                strict.command_options.extend([
+                    "--nokeep_going".into(),
+                    "--proto:rule_classes".into(),
+                    "--noproto:flatten_selects".into(),
+                    "--proto:output_rule_attrs=actual,srcs,data".into(),
+                ]);
+                let names = forwarders.keys().cloned().collect();
+                let read = strict.query_with(
+                    &self.with_exclude_filter(query_set(&names)?),
+                    false,
+                    version,
+                    &mut |_| {},
+                );
+                for row in self.optional_query_result(read)?.into_iter().flatten() {
+                    let Some(rule) = row.rule.as_option() else {
+                        continue;
+                    };
+                    let Some((owner, mut absent)) = forwarders.remove(&canonical(&rule.name))
+                    else {
+                        continue;
+                    };
+                    let native = rule.rule_class_key.as_deref();
+                    for attr in &rule.attribute {
+                        if !matches!(
+                            (native, attr.name.as_str()),
+                            (Some("alias"), "actual") | (Some("filegroup"), "srcs" | "data")
+                        ) {
+                            continue;
+                        }
+                        if attr.selector_list.as_option().is_none() {
+                            for child in attr.string_value.iter().chain(&attr.string_list_value) {
+                                let key = canonical(child);
+                                if absent.remove(&key) {
+                                    pending.entry(key).or_default().insert(owner.clone());
+                                }
+                            }
+                        } else if let Some(select) = attr.selector_list.as_option() {
+                            for entry in select.elements.iter().flat_map(|s| &s.entries) {
+                                for child in
+                                    entry.string_value.iter().chain(&entry.string_list_value)
+                                {
+                                    let key = canonical(child);
+                                    if absent.remove(&key) {
+                                        unknown.entry(owner.clone()).or_default().insert(key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !absent.is_empty() {
+                        // These are other loading inputs, including the selector's key,
+                        // not possible providers. Their normal repository edge survives.
+                        if !matches!(native, Some("alias" | "filegroup")) {
+                            unknown.entry(owner).or_default().extend(absent);
+                        }
+                    }
+                }
+                for (_, (owner, absent)) in forwarders {
+                    unknown.entry(owner).or_default().extend(absent);
+                }
+            }
+
+            let names: BTreeSet<_> = pending
+                .keys()
+                .filter(|name| tried.insert((*name).clone()))
+                .cloned()
+                .collect();
+            cursor = end;
+            if !names.is_empty() {
+                let mut strict = self.clone();
+                strict.keep_going = false;
+                strict.command_options.push("--nokeep_going".into());
+                let rows = strict.query_with(
+                    &self.with_exclude_filter(query_set(&names)?),
+                    false,
+                    version,
+                    &mut |_| {},
+                );
+                if let Some(mut rows) = self.optional_query_result(rows)? {
+                    rows.retain(|row| {
+                        target_name(row).is_some_and(|name| present.insert(canonical(name)))
+                    });
+                    transform(&mut rows, None);
+                    targets.extend(rows);
+                }
+            }
+            reached = fine.reached(
+                targets,
+                &targets[cursor..],
+                roots.named,
+                &mapping,
+                &mut visited_fine,
+            );
+            for (name, owners) in pending {
+                if !present.contains(&name) {
+                    for owner in owners {
+                        unknown.entry(owner).or_default().insert(name.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Join declared reader types with native registrations and their named implementations.
+    /// Missing bodies are reported at the reader which requested the matching type.
+    fn connect_module_toolchains(
+        &self,
+        targets: &mut Vec<Target>,
+        registrations: &[String],
+        root_mapping: Option<&[u8]>,
+        version: Option<BazelVersion>,
+        provider_packages: &mut ProviderPackages,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<ModuleToolchainInputs> {
+        let mapping = root_mapping
+            .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
+            .unwrap_or_default();
+        let canonical =
+            |name: &str| canonical_query_label(main_repo_label_key(name), &mapping).into_owned();
+        let fine_repositories = fine_repository_names(&self.fine_grained_external_repos, &mapping);
+        let values = |a: &Attribute| {
+            let values: Vec<_> = scalar_label_values(a).collect();
+            let labels: BTreeSet<_> = values
+                .iter()
+                .flatten()
+                .map(|s| canonical(s))
+                .filter(|s| usable_toolchain_label(s))
+                .collect();
+            let complete = !values.is_empty()
+                && values
+                    .iter()
+                    .all(|v| v.is_some_and(|s| usable_toolchain_label(&canonical(s))));
+            (labels, complete)
+        };
+
+        let required_by = |rows: &[Target]| {
+            rows.iter()
+                .filter_map(|row| row.rule.as_option()?.possible_toolchain_types.as_option())
+                .flat_map(|types| types.label.iter().map(|name| canonical(name)))
+                .collect::<BTreeSet<_>>()
+        };
+        let mut required = required_by(targets);
+
+        let enrolled: Vec<_> = registrations.iter().map(|label| canonical(label)).collect();
+        let mut pending: BTreeSet<_> = enrolled.iter().cloned().collect();
+        // Existing declarations can be referenced by local configuration even without a MODULE registration.
+        let mut ready: Vec<_> = targets
+            .iter()
+            .filter_map(|row| row.rule.as_option())
+            .filter(|rule| rule.rule_class == "toolchain")
+            .map(|rule| canonical(&rule.name))
+            .collect();
+        let mut potential_aliases = HashMap::<String, Vec<String>>::new();
+        for rule in targets
+            .iter()
+            .filter_map(|row| row.rule.as_option())
+            .filter(|rule| rule.rule_class == "alias")
+        {
+            for input in &rule.rule_input {
+                potential_aliases
+                    .entry(canonical(input))
+                    .or_default()
+                    .push(canonical(&rule.name));
+            }
+        }
+        while let Some(label) = ready.pop() {
+            if let Some(parents) = potential_aliases.remove(&label) {
+                ready.extend(parents);
+            }
+            pending.insert(label);
+        }
+        let mut seen = BTreeSet::new();
+        let mut acquired = Vec::new();
+        let mut aliases = BTreeMap::new();
+        let mut literal_aliases = BTreeSet::new();
+        let mut declarations = BTreeMap::<String, Declaration>::new();
+        let mut native_types = BTreeSet::new();
+        let mut incomplete = BTreeSet::new();
+        let mut body_aliases = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut checked_body_aliases = BTreeSet::new();
+        let mut opaque_body_aliases = BTreeSet::new();
+        let mut projected = BTreeSet::new();
+        let structure = self.toolchain_structure_query();
+
+        loop {
+            pending.extend(required.iter().cloned());
+            while !pending.is_empty() {
+                let mut batch = std::mem::take(&mut pending);
+                batch.retain(|label| usable_toolchain_label(label) && seen.insert(label.clone()));
+                if batch.is_empty() {
+                    break;
+                }
+                let rows = structure.query_with(
+                    &self.with_exclude_filter(query_set(&batch)?),
+                    false,
+                    version,
+                    &mut |_| {},
+                )?;
+                for row in rows {
+                    let Some(rule) = row.rule.as_option() else {
+                        continue;
+                    };
+                    let name = canonical(&rule.name);
+                    if !batch.contains(&name) {
+                        continue;
+                    }
+                    let attr = |name| rule.attribute.iter().find(|a| a.name == name);
+                    match rule.rule_class_key.as_deref() {
+                        Some("toolchain_type") => {
+                            native_types.insert(name);
+                        }
+                        Some("alias") => {
+                            let Some(actual) = attr("actual") else {
+                                continue;
+                            };
+                            let (children, complete) = values(actual);
+                            if complete && actual.selector_list.as_option().is_none() {
+                                literal_aliases.insert(name.clone());
+                            }
+                            if !complete {
+                                incomplete.insert(name.clone());
+                            }
+                            pending.extend(children.iter().cloned());
+                            aliases.insert(name, children);
+                        }
+                        Some("toolchain") => {
+                            let Some(ty) = attr("toolchain_type")
+                                .filter(|a| {
+                                    a.nodep == Some(false) && a.selector_list.as_option().is_none()
+                                })
+                                .and_then(|a| a.string_value.as_deref())
+                                .map(&canonical)
+                                .filter(|s| usable_toolchain_label(s))
+                            else {
+                                continue;
+                            };
+                            let Some(binding) = attr("toolchain").filter(|a| a.nodep == Some(true))
+                            else {
+                                continue;
+                            };
+                            let (bodies, complete) = values(binding);
+                            // lower_query_target appends these exact NODEP values after Bazel's real inputs.
+                            // Retain an independently present ordinary edge, even to the same label.
+                            let injected: Vec<_> = scalar_label_values(binding).flatten().collect();
+                            let Some(ordinary_count) =
+                                rule.rule_input.len().checked_sub(injected.len())
+                            else {
+                                bail!("missing ordinary toolchain input boundary for {name}");
+                            };
+                            if !rule.rule_input[ordinary_count..]
+                                .iter()
+                                .map(String::as_str)
+                                .eq(injected.iter().copied())
+                            {
+                                bail!("inconsistent ordinary toolchain input boundary for {name}");
+                            }
+                            let implementation_inputs =
+                                injected.into_iter().map(&canonical).collect();
+                            let ordinary = rule.rule_input[..ordinary_count]
+                                .iter()
+                                .map(|s| canonical(s))
+                                .collect();
+                            let binding_digest = Sha256::digest(binding.encode_to_vec()).into();
+                            if !complete {
+                                incomplete.insert(name.clone());
+                            }
+                            // On producers where target_settings is NODEP, the resolver
+                            // reads the matching condition in the consumer's configuration.
+                            let mut settings = BTreeSet::new();
+                            if let Some(setting) =
+                                attr("target_settings").filter(|a| a.nodep == Some(true))
+                            {
+                                use crate::proto::blaze_query::attribute::Discriminator;
+                                let values: Vec<_> = if setting.r#type == Discriminator::StringList
+                                {
+                                    setting.string_list_value.iter().collect()
+                                } else if let Some(select) =
+                                    setting.selector_list.as_option().filter(|s| {
+                                        setting.r#type == Discriminator::SelectorList
+                                            && s.r#type
+                                                .is_some_and(|t| t == Discriminator::StringList)
+                                    })
+                                {
+                                    select
+                                        .elements
+                                        .iter()
+                                        .flat_map(|e| &e.entries)
+                                        .flat_map(|e| &e.string_list_value)
+                                        .collect()
+                                } else {
+                                    return Err(anyhow::anyhow!(
+                                        "Unrecognized NODEP target_settings on {name}"
+                                    ));
+                                };
+                                for value in values {
+                                    let label = canonical(value);
+                                    if !usable_toolchain_label(&label) {
+                                        return Err(anyhow::anyhow!(
+                                            "Unresolved target_settings on {name}"
+                                        ));
+                                    }
+                                    settings.insert(label);
+                                }
+                            }
+                            pending.insert(ty.clone());
+                            declarations.insert(
+                                name,
+                                Declaration {
+                                    ty,
+                                    bodies,
+                                    implementation_inputs,
+                                    ordinary,
+                                    binding: binding_digest,
+                                    settings,
+                                    literal: complete
+                                        && binding.selector_list.as_option().is_none(),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let closed_types = closed_aliases(native_types.clone(), &aliases, &incomplete);
+            // A verified declaration/type establishes membership even when its NODEP body is
+            // unmapped. The binding remains hashed; literal acquisition still requires every
+            // matched declaration's body to be usable.
+            let closed_registrations = closed_aliases(
+                declarations
+                    .iter()
+                    .filter(|(_, d)| closed_types.contains(&d.ty))
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                &aliases,
+                &incomplete,
+            );
+            let complete_registry = enrolled
+                .iter()
+                .all(|name| closed_registrations.contains(name));
+            let type_keys = |name: &str| toolchain_type_keys(name, &aliases, &native_types);
+            let mut by_key = BTreeMap::<String, BTreeSet<String>>::new();
+            for ty in &required {
+                for key in type_keys(ty) {
+                    by_key.entry(key).or_default().insert(ty.clone());
+                }
+            }
+            let mut families = BTreeMap::<String, ToolchainFamily>::new();
+            let mut chosen = BTreeSet::new();
+            let mut active = BTreeSet::new();
+            for registration in &enrolled {
+                let path = reachable_aliases(registration, &aliases);
+                let mut matches = BTreeSet::new();
+                let mut matching_declarations = BTreeSet::new();
+                for name in &path {
+                    let Some(declaration) = declarations.get(name) else {
+                        continue;
+                    };
+                    for key in type_keys(&declaration.ty) {
+                        for ty in by_key.get(&key).into_iter().flatten() {
+                            matches.insert(ty.clone());
+                            matching_declarations.insert(name.clone());
+                            families
+                                .entry(ty.clone())
+                                .or_default()
+                                .declarations
+                                .insert(name.clone());
+                            active.insert(name.clone());
+                        }
+                    }
+                }
+                if !matches.is_empty() {
+                    // Every consulted alias binding is an actual named loading input.
+                    // Only matching native declarations can nominate provider bodies.
+                    for node in &path {
+                        if matching_declarations.contains(node)
+                            || aliases.contains_key(node)
+                                && !reachable_aliases(node, &aliases)
+                                    .is_disjoint(&matching_declarations)
+                        {
+                            chosen.insert(node.clone());
+                        }
+                    }
+                    for ty in matches {
+                        families
+                            .entry(ty)
+                            .or_default()
+                            .registrations
+                            .push(registration.clone());
+                    }
+                }
+            }
+
+            let mut registration_paths = chosen.clone();
+            for ty in &required {
+                registration_paths.extend(
+                    reachable_aliases(ty, &aliases)
+                        .into_iter()
+                        .filter(|name| native_types.contains(name) || aliases.contains_key(name)),
+                );
+            }
+            let mut candidates = BTreeSet::new();
+            let mut settings = BTreeSet::new();
+            let mut optional_bodies = BTreeSet::new();
+            for name in &active {
+                let declaration = &declarations[name];
+                candidates.extend(declaration.bodies.iter().cloned());
+                settings.extend(declaration.settings.iter().cloned());
+                chosen.extend(
+                    declaration
+                        .settings
+                        .iter()
+                        .filter(|setting| {
+                            setting.rsplit_once(':').map(|(pkg, _)| pkg)
+                                == name.rsplit_once(':').map(|(pkg, _)| pkg)
+                        })
+                        .cloned(),
+                );
+                optional_bodies.extend(
+                    declaration
+                        .bodies
+                        .iter()
+                        .filter(|body| {
+                            body.split_once("//")
+                                .zip(name.split_once("//"))
+                                .is_some_and(|(b, d)| b.0 == d.0)
+                        })
+                        .cloned(),
+                );
+            }
+            let mut unique_bodies = BTreeSet::new();
+            if complete_registry {
+                for (ty, family) in &families {
+                    let names = &family.declarations;
+                    if !closed_types.contains(ty) || !names.iter().all(|n| declarations[n].literal)
+                    {
+                        continue;
+                    }
+                    let bodies: BTreeSet<_> =
+                        names.iter().flat_map(|n| &declarations[n].bodies).collect();
+                    let packages: Option<BTreeSet<_>> = bodies
+                        .iter()
+                        .map(|name| name.rsplit_once(':').map(|(package, _)| package))
+                        .collect();
+                    if bodies.len() == 1 {
+                        let only_literals = |label: &str| {
+                            reachable_aliases(label, &aliases).iter().all(|node| {
+                                !aliases.contains_key(node) || literal_aliases.contains(node)
+                            })
+                        };
+                        if only_literals(ty)
+                            && names
+                                .iter()
+                                .all(|name| only_literals(&declarations[name].ty))
+                            && family.registrations.iter().all(|name| only_literals(name))
+                        {
+                            unique_bodies.extend(bodies.iter().map(|label| (**label).clone()));
+                        }
+                    }
+                    if packages.is_some_and(|packages| packages.len() == 1) {
+                        optional_bodies.extend(bodies.into_iter().cloned());
+                    }
+                }
+            }
+
+            // Each actual of an authenticated implementation alias is a possible
+            // provider. Ordinary dependencies of an implementation do not acquire this role.
+            for children in body_aliases.values() {
+                candidates.extend(children.iter().cloned());
+                optional_bodies.extend(children.iter().cloned());
+            }
+            // A returned row identifies a repository whose provider packages may be inspected.
+            // It does not establish that another named implementation exists.
+            let mut represented = HashSet::new();
+            let mut observed = BTreeMap::<String, String>::new();
+            for row in targets.iter().chain(&acquired) {
+                let Some(spelling) = target_name(row) else {
+                    continue;
+                };
+                if main_repo_label_key(spelling).starts_with("//external:") {
+                    continue;
+                }
+                let name = canonical_query_label(spelling, &mapping);
+                if let Some((repo, _)) = name.split_once("//") {
+                    represented.insert(repo.to_owned());
+                }
+                if chosen.contains(name.as_ref())
+                    || candidates.contains(name.as_ref())
+                    || settings.contains(name.as_ref())
+                {
+                    observed
+                        .entry(name.into_owned())
+                        .or_insert_with(|| spelling.to_owned());
+                }
+            }
+            optional_bodies.extend(
+                candidates
+                    .iter()
+                    .filter(|body| {
+                        body.split_once("//")
+                            .is_some_and(|(repo, _)| represented.contains(repo))
+                    })
+                    .cloned(),
+            );
+            chosen.extend(
+                settings
+                    .iter()
+                    .filter(|setting| {
+                        setting
+                            .split_once("//")
+                            .is_some_and(|(repo, _)| represented.contains(repo))
+                    })
+                    .cloned(),
+            );
+            chosen.extend(
+                optional_bodies
+                    .intersection(&provider_packages.targets)
+                    .cloned(),
+            );
+            chosen.retain(|label| !observed.contains_key(label) && projected.insert(label.clone()));
+            let mut fresh = if chosen.is_empty() {
+                Vec::new()
+            } else {
+                let mut fresh = self.query_with(
+                    &self.with_exclude_filter(query_set(&chosen)?),
+                    false,
+                    version,
+                    &mut |_| {},
+                )?;
+                fresh.retain(|row| {
+                    target_name(row).is_some_and(|name| chosen.contains(&canonical(name)))
+                });
+                fresh
+            };
+            optional_bodies
+                .retain(|label| !observed.contains_key(label) && projected.insert(label.clone()));
+            if !optional_bodies.is_empty() {
+                fresh.extend(self.query_optional_provider_packages(
+                    &optional_bodies,
+                    &fine_repositories,
+                    provider_packages,
+                    &mapping,
+                    version,
+                )?);
+            }
+            if !fresh.is_empty() {
+                retain_supplemental_targets(&mut fresh, targets);
+                for row in &fresh {
+                    if let Some(name) = target_name(row) {
+                        observed
+                            .entry(canonical(name))
+                            .or_insert_with(|| name.to_owned());
+                    }
+                }
+                let count = required.len();
+                required.extend(required_by(&fresh));
+                acquired.extend(fresh);
+                if required.len() != count {
+                    continue;
+                }
+            }
+
+            // The normal projection may suppress alias.actual or flatten its select.
+            // Inspect only already-returned potential aliases on a real provider path.
+            let inspect: BTreeSet<_> = targets
+                .iter()
+                .chain(&acquired)
+                .filter_map(|row| {
+                    let rule = row.rule.as_option()?;
+                    if rule.rule_class != "alias" {
+                        return None;
+                    }
+                    let name = canonical(&rule.name);
+                    (candidates.contains(&name) && checked_body_aliases.insert(name.clone()))
+                        .then_some(name)
+                })
+                .collect();
+            if !inspect.is_empty() {
+                opaque_body_aliases.extend(inspect.iter().cloned());
+                let (bindings, ordinary_rules) = structure.alias_actuals(&inspect, version)?;
+                for name in ordinary_rules {
+                    opaque_body_aliases.remove(&canonical(&name));
+                }
+                for (name, actual) in bindings {
+                    let name = canonical(&name);
+                    if inspect.contains(&name) {
+                        let (children, complete) = values(&actual);
+                        if complete {
+                            opaque_body_aliases.remove(&name);
+                        }
+                        body_aliases.insert(name, children);
+                    }
+                }
+                continue;
+            }
+
+            let ready_bodies = closed_aliases(
+                candidates
+                    .iter()
+                    .filter(|name| {
+                        observed.contains_key(*name)
+                            && !opaque_body_aliases.contains(*name)
+                            && !body_aliases.contains_key(*name)
+                    })
+                    .cloned()
+                    .collect(),
+                &body_aliases,
+                &opaque_body_aliases,
+            );
+            // This is a certificate about a single observed implementation rule,
+            // not about selectable aliases which happen to name the same operand.
+            unique_bodies
+                .retain(|body| ready_bodies.contains(body) && !body_aliases.contains_key(body));
+            for family in families.values_mut() {
+                for name in &family.declarations {
+                    for body in &declarations[name].bodies {
+                        if ready_bodies.contains(body) {
+                            continue;
+                        }
+                        let mut unknown = reachable_aliases(body, &body_aliases);
+                        unknown.retain(|name| {
+                            !observed.contains_key(name) || opaque_body_aliases.contains(name)
+                        });
+                        if unknown.is_empty() {
+                            // Every row in a pure alias cycle can be present without a provider.
+                            unknown.insert(body.clone());
+                        }
+                        family.missing.extend(unknown);
+                    }
+                }
+            }
+            // Keep the primary and its prehashed state intact if a later strict
+            // metadata read fails while following a newly discovered reader type.
+            if !acquired.is_empty() {
+                transform(&mut acquired, None);
+                targets.append(&mut acquired);
+            }
+            // Discard only the NODEP implementation inputs appended by #619. Further
+            // discovery walks the actual ordinary inputs, including any genuine duplicate.
+            for rule in targets
+                .iter_mut()
+                .filter_map(|row| row.rule.as_option_mut())
+            {
+                if let Some(declaration) = declarations.get(&canonical(&rule.name)) {
+                    rule.rule_input.retain(|input| {
+                        let key = canonical(input);
+                        !declaration.implementation_inputs.contains(&key)
+                            || declaration.ordinary.contains(&key)
+                    });
+                }
+            }
+            // A local registration can be introduced by a transition outside MODULE.
+            // Its unresolved availability belongs to the actual ordinary referrer.
+            let enrolled_declarations: BTreeSet<_> = enrolled
+                .iter()
+                .flat_map(|label| reachable_aliases(label, &aliases))
+                .filter(|label| declarations.contains_key(label))
+                .collect();
+            let local: BTreeSet<_> = declarations
+                .keys()
+                .filter(|name| !enrolled_declarations.contains(*name))
+                .cloned()
+                .collect();
+            let mut resolution_roots = registration_paths.clone();
+            resolution_roots.extend(candidates);
+            resolution_roots.extend(settings);
+            return Ok(ModuleToolchainInputs {
+                complete: complete_registry,
+                closed_types,
+                closed_registrations,
+                registration_paths,
+                unique_bodies,
+                resolution_roots,
+                declarations,
+                aliases,
+                body_aliases,
+                incomplete,
+                local,
+                native_types,
+                observed,
+                families,
+            });
+        }
+    }
+
+    fn toolchain_structure_query(&self) -> Self {
+        let mut structure = self.clone();
+        structure.keep_going = false;
+        structure.command_options.extend([
+            "--nokeep_going".into(),
+            "--consistent_labels".into(),
+            "--proto:rule_classes".into(),
+            "--noproto:flatten_selects".into(),
+            "--proto:output_rule_attrs=toolchain_type,toolchain,target_settings,actual".into(),
+        ]);
+        structure
+    }
+
+    /// Determine which original referrers may carry a local transition registration after
+    /// positive targets and registration aliases have been observed. Only settings that
+    /// satisfy the existing same-package or represented-repository bound can add rows.
+    fn local_toolchain_inputs(
+        &self,
+        targets: &mut Vec<Target>,
+        catalog: &ModuleToolchainInputs,
+        mapping: &HashMap<String, String>,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<LocalToolchainInputs> {
+        if catalog.local.is_empty() {
+            return Ok(LocalToolchainInputs::default());
+        }
+        let canonical =
+            |name: &str| canonical_query_label(main_repo_label_key(name), mapping).into_owned();
+        let represented: HashSet<_> = targets
+            .iter()
+            .filter_map(target_name)
+            .filter(|name| !main_repo_label_key(name).starts_with("//external:"))
+            .filter_map(|name| {
+                let key = canonical_query_label(name, mapping);
+                key.split_once("//").map(|(repo, _)| repo.to_owned())
+            })
+            .collect();
+        let structure = self.toolchain_structure_query();
+        let local = &catalog.local;
+        let declarations = &catalog.declarations;
+        let aliases = &catalog.aliases;
+        let closed_types = &catalog.closed_types;
+        let type_keys = |name: &str| toolchain_type_keys(name, aliases, &catalog.native_types);
+        let mut local_inputs = LocalToolchainInputs::default();
+        let mut setting_reads = BTreeSet::new();
+        let mut forwarded: BTreeMap<String, BTreeSet<String>> = local
+            .iter()
+            .map(|name| (name.clone(), BTreeSet::from([name.clone()])))
+            .collect();
+        for alias in aliases.keys() {
+            let mut destinations = reachable_aliases(alias, aliases);
+            destinations.retain(|name| local.contains(name));
+            if !destinations.is_empty() {
+                forwarded.insert(alias.clone(), destinations);
+            }
+        }
+        let barriers = closed_aliases(
+            declarations.keys().cloned().collect(),
+            aliases,
+            &catalog.incomplete,
+        );
+        let index: HashMap<_, _> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, target)| Some((canonical(target_name(target)?), i)))
+            .collect();
+        let mut origins = Vec::new();
+        let mut missing_children = BTreeSet::new();
+        for (i, row) in targets.iter().enumerate() {
+            let Some(rule) = row.rule.as_option() else {
+                continue;
+            };
+            if barriers.contains(&canonical(&rule.name)) {
+                continue;
+            }
+            let local_decls: BTreeSet<_> = rule
+                .rule_input
+                .iter()
+                .filter_map(|input| forwarded.get(&canonical(input)))
+                .flatten()
+                .cloned()
+                .collect();
+            if local_decls.is_empty() {
+                continue;
+            }
+            for input in &rule.rule_input {
+                let key = canonical(input);
+                if !index.contains_key(&key) && usable_toolchain_label(&key) {
+                    missing_children.insert(key);
+                }
+            }
+            origins.push((i, local_decls));
+        }
+        // Prove only source/package-group leaves. A missing or excluded input still
+        // represents an unknown reader, as does a generated file without its generator.
+        // Bazel resolves bazel_tools to its embedded tree or an explicit local path
+        // override. Other unrepresented repositories retain the unknown-reader obligation.
+        missing_children.retain(|label| {
+            label
+                .split_once("//")
+                .is_some_and(|(repo, _)| represented.contains(repo) || repo == "@@bazel_tools")
+        });
+        let mut leaves = BTreeSet::new();
+        if !missing_children.is_empty() {
+            let query = structure.with_exclude_filter(query_set(&missing_children)?);
+            for row in structure.query_with(&query, false, version, &mut |_| {})? {
+                if row.source_file.as_option().is_some()
+                    || row.rule.as_option().is_some_and(|r| {
+                        r.rule_class == "package_group"
+                            && r.possible_toolchain_types.as_option().is_none()
+                    })
+                {
+                    if let Some(name) = target_name(&row) {
+                        leaves.insert(canonical(name));
+                    }
+                }
+            }
+        }
+        for (origin, decls) in origins {
+            let mut used = BTreeSet::new();
+            let mut uncertain = false;
+            let mut seen = HashSet::new();
+            let mut work = vec![origin];
+            while let Some(next) = work.pop() {
+                if !seen.insert(next) {
+                    continue;
+                }
+                let row = &targets[next];
+                let deps: &[String] = if let Some(rule) = row.rule.as_option() {
+                    if barriers.contains(&canonical(&rule.name)) {
+                        continue;
+                    }
+                    if let Some(types) = rule.possible_toolchain_types.as_option() {
+                        for ty in &types.label {
+                            let spelling = canonical(ty);
+                            if !closed_types.contains(&spelling) {
+                                uncertain = true;
+                            }
+                            used.extend(type_keys(&spelling));
+                        }
+                    } else if rule.rule_class == "package_group" {
+                        continue;
+                    } else {
+                        uncertain = true;
+                    }
+                    &rule.rule_input
+                } else if let Some(output) = row.generated_file.as_option() {
+                    std::slice::from_ref(&output.generating_rule)
+                } else {
+                    continue;
+                };
+                for input in deps {
+                    let name = canonical(input);
+                    if barriers.contains(&name)
+                        || leaves.contains(&name)
+                        || name.starts_with("//external:")
+                    {
+                        continue;
+                    }
+                    if let Some(&child) = index.get(&name) {
+                        work.push(child);
+                    } else {
+                        uncertain = true;
+                    }
+                }
+            }
+            let holder = target_name(&targets[origin])
+                .expect("observed rule")
+                .to_owned();
+            for decl in decls {
+                let declaration = &declarations[&decl];
+                let closed = closed_types.contains(&declaration.ty);
+                let matched = !used.is_disjoint(&type_keys(&declaration.ty));
+                if closed && matched {
+                    local_inputs.resolution_roots.extend(
+                        declaration
+                            .bodies
+                            .iter()
+                            .chain(&declaration.settings)
+                            .cloned(),
+                    );
+                }
+                if uncertain || !closed || matched {
+                    local_inputs
+                        .referrers
+                        .entry(holder.clone())
+                        .or_default()
+                        .insert(decl.clone());
+                    setting_reads.extend(
+                        declaration
+                            .settings
+                            .iter()
+                            .filter(|input| {
+                                input.rsplit_once(':').map(|p| p.0)
+                                    == decl.rsplit_once(':').map(|p| p.0)
+                                    || input
+                                        .split_once("//")
+                                        .is_some_and(|p| represented.contains(p.0))
+                            })
+                            .cloned(),
+                    );
+                }
+            }
+        }
+        for label in targets.iter().filter_map(target_name) {
+            setting_reads.remove(&canonical(label));
+        }
+        if !setting_reads.is_empty() {
+            let mut rows = self.query_with(
+                &self.with_exclude_filter(query_set(&setting_reads)?),
+                false,
+                version,
+                &mut |_| {},
+            )?;
+            rows.retain(|row| {
+                target_name(row).is_some_and(|name| setting_reads.contains(&canonical(name)))
+            });
+            retain_supplemental_targets(&mut rows, targets);
+            transform(&mut rows, None);
+            targets.extend(rows);
+        }
+        Ok(local_inputs)
+    }
+
     /// A fine repository may expose libraries in other repositories through aliases. Follow
     /// actual targets of aliases used by the ordinary graph, without enrolling more namespaces.
     fn acquire_alias_inputs(
@@ -595,58 +2381,19 @@ impl BazelOptions {
         let mapping = root_mapping
             .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
             .unwrap_or_default();
-        let fine: HashSet<_> = self
-            .fine_grained_external_repos
-            .iter()
-            .map(|repo| {
-                let name = repo.trim_start_matches('@');
-                if repo.starts_with("@@") {
-                    name
-                } else {
-                    mapping.get(name).map_or(name, String::as_str)
-                }
-            })
-            .collect();
-        let fine_target = |name: &str| {
-            name.strip_prefix('@')
-                .and_then(|name| name.split_once("//"))
-                .is_some_and(|(repo, _)| {
-                    let canonical = repo
-                        .strip_prefix('@')
-                        .unwrap_or_else(|| mapping.get(repo).map_or(repo, String::as_str));
-                    fine.contains(canonical)
-                })
-        };
-        let mut primary = HashSet::new();
-        let mut inside = HashMap::new();
-        let mut queue = Vec::new();
-        for row in targets.iter() {
-            let Some(name) = target_name(row) else {
-                continue;
-            };
-            let id = canonical_query_label(name, &mapping);
-            primary.insert(id.clone());
-            if fine_target(name) {
-                inside.insert(id, row);
-            } else if !main_repo_label_key(name).starts_with("//external:") {
-                queue.extend(target_inputs(row).filter(|s| fine_target(s)));
-            }
-        }
-        let mut walked = HashSet::new();
-        let mut aliases = BTreeSet::new();
-        while let Some(input) = queue.pop() {
-            let id = canonical_query_label(input, &mapping);
-            if !walked.insert(id.clone()) {
-                continue;
-            }
-            let Some(&row) = inside.get(&id) else {
-                continue;
-            };
-            if let Some(rule) = row.rule.as_option().filter(|r| r.rule_class == "alias") {
-                aliases.insert(rule.name.clone());
-            }
-            queue.extend(target_inputs(row).filter(|s| fine_target(s)));
-        }
+        let aliases = FineQueryRows::new(&self.fine_grained_external_repos, targets, &mapping)
+            .reached(
+                targets,
+                targets,
+                &BTreeSet::new(),
+                &mapping,
+                &mut HashSet::new(),
+            )
+            .into_iter()
+            .filter_map(|i| targets[i].rule.as_option())
+            .filter(|r| r.rule_class == "alias")
+            .map(|r| r.name.clone())
+            .collect::<BTreeSet<_>>();
         if aliases.is_empty() {
             return Ok(());
         }
@@ -661,28 +2408,23 @@ impl BazelOptions {
 
         // The caller may exclude actual from the attributes it wants to hash. Inspect this
         // finite set separately; keep the original rows and their full select-condition inputs.
-        let mut bindings = self.alias_actuals(&aliases, version)?;
+        let (mut bindings, _) = self.alias_actuals(&aliases, Some(version))?;
         if bindings.is_empty() {
             return Ok(());
         }
+        let primary: HashSet<_> = targets
+            .iter()
+            .filter_map(target_name)
+            .map(|label| canonical_query_label(label, &mapping))
+            .collect();
         let mut missing = BTreeSet::new();
         for actual in bindings.values() {
-            for destination in actual
-                .string_value
-                .iter()
-                .chain(
-                    actual
-                        .selector_list
-                        .as_option()
-                        .into_iter()
-                        .flat_map(|list| &list.elements)
-                        .flat_map(|selector| &selector.entries)
-                        .filter_map(|e| e.string_value.as_ref()),
-                )
+            for destination in scalar_label_values(actual)
+                .flatten()
                 .filter(|label| !label.is_empty())
             {
                 if !primary.contains(&canonical_query_label(destination, &mapping)) {
-                    missing.insert(destination.clone());
+                    missing.insert(destination.to_owned());
                 }
             }
         }
@@ -716,30 +2458,16 @@ impl BazelOptions {
             .filter(|r| r.rule_class_key.as_deref() == Some("alias"))
             .map(|r| r.name.clone())
             .collect();
-        bindings.extend(self.alias_actuals(&new_aliases, version)?);
+        bindings.extend(self.alias_actuals(&new_aliases, Some(version))?.0);
         // Primary and supplemental rows may have been prehashed, which releases their
         // projected attributes. Re-read only these native aliases with the original options,
         // then use their evaluated actual, including the mapping of select keys to labels.
-        let names = bindings.keys().cloned().collect();
-        let mut aliases_with_attrs = strict.query_with(
-            &self.with_exclude_filter(query_set(&names)?),
-            false,
-            Some(version),
-            &mut |_| {},
-        )?;
-        let mut alias_attrs = HashMap::new();
-        for row in &mut aliases_with_attrs {
-            if let Some(rule) = row.rule.as_option_mut() {
-                if let Some(actual) = bindings.remove(&rule.name) {
-                    rule.attribute.retain(|attr| attr.name != "actual");
-                    rule.attribute.push(actual);
-                    alias_attrs.insert(rule.name.clone(), std::mem::take(&mut rule.attribute));
-                }
-            }
-        }
-        if !bindings.is_empty() {
-            bail!("Bazel did not return all observed forwarding aliases");
-        }
+        let mut alias_attrs: HashMap<_, _> = strict
+            .query_aliases_with_bindings(bindings, Some(version))?
+            .into_iter()
+            .filter_map(|row| row.rule.into_option())
+            .map(|rule| (rule.name, rule.attribute))
+            .collect();
         let first = targets.len();
         targets.extend(extra);
         let mut definitions: HashMap<String, Vec<String>> = targets[first..]
@@ -789,11 +2517,19 @@ impl BazelOptions {
     fn alias_actuals(
         &self,
         aliases: &BTreeSet<String>,
-        version: BazelVersion,
-    ) -> Result<BTreeMap<String, Attribute>> {
+        version: Option<BazelVersion>,
+    ) -> Result<(BTreeMap<String, Attribute>, BTreeSet<String>)> {
         if aliases.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), BTreeSet::new()));
         }
+        self.query_alias_actuals(&query_set(aliases)?, version)
+    }
+
+    fn query_alias_actuals(
+        &self,
+        expression: &str,
+        version: Option<BazelVersion>,
+    ) -> Result<(BTreeMap<String, Attribute>, BTreeSet<String>)> {
         let mut metadata = self.clone();
         metadata.keep_going = false;
         metadata.command_options.extend([
@@ -803,22 +2539,56 @@ impl BazelOptions {
             "--noproto:flatten_selects".into(),
         ]);
         let records = metadata.query_with(
-            &self.with_exclude_filter(query_set(aliases)?),
+            &self.with_exclude_filter(expression.to_owned()),
             false,
-            Some(version),
+            version,
             &mut |_| {},
         )?;
-        Ok(records
-            .into_iter()
-            .filter_map(|target| {
-                let rule = target.rule.into_option()?;
-                if rule.rule_class_key.as_deref() != Some("alias") {
-                    return None;
-                }
-                let actual = rule.attribute.into_iter().find(|a| a.name == "actual")?;
-                Some((rule.name, actual))
-            })
-            .collect())
+        let mut bindings = BTreeMap::new();
+        let mut ordinary_rules = BTreeSet::new();
+        for target in records {
+            let Some(rule) = target.rule.into_option() else {
+                continue;
+            };
+            if rule.rule_class_key.as_deref() != Some("alias") {
+                ordinary_rules.insert(rule.name);
+            } else if let Some(actual) = rule.attribute.into_iter().find(|a| a.name == "actual") {
+                bindings.insert(rule.name, actual);
+            }
+        }
+        Ok((bindings, ordinary_rules))
+    }
+
+    fn query_aliases_with_bindings(
+        &self,
+        mut bindings: BTreeMap<String, Attribute>,
+        version: Option<BazelVersion>,
+    ) -> Result<Vec<Target>> {
+        if bindings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = bindings.keys().cloned().collect();
+        let mut rows = self.query_with(
+            &self.with_exclude_filter(query_set(&names)?),
+            false,
+            version,
+            &mut |_| {},
+        )?;
+        rows.retain_mut(|row| {
+            let Some(rule) = row.rule.as_option_mut() else {
+                return false;
+            };
+            let Some(actual) = bindings.remove(&rule.name) else {
+                return false;
+            };
+            rule.attribute.retain(|attr| attr.name != "actual");
+            rule.attribute.push(actual);
+            true
+        });
+        if !bindings.is_empty() {
+            bail!("Bazel did not return all observed forwarding aliases");
+        }
+        Ok(rows)
     }
 
     /// `external_package` is whether `//external` exists, when known; `Some(false)` leaves it out
@@ -1006,20 +2776,38 @@ impl BazelOptions {
                 BTreeSet::new()
             },
         };
-        let targets = lower_repositories(
+        let uncertain = uncertain_repository_targets(
+            &survey.uncertain_repos,
+            &repositories,
+            &canonical_to_apparent,
+            &module_edges,
+            transform,
+        );
+        // Incomplete mappings retain the legacy relationships: an absent mapping cannot
+        // identify which ordinary repository references need the localized coarse group.
+        let localize_repository_inputs =
+            survey.precise_toolchain_inputs && extension_repos.complete_mappings;
+        let coarse = if localize_repository_inputs {
+            coarse_repository_targets(
+                &survey.coarse_repos,
+                &extension_repos,
+                &canonical_to_apparent,
+                transform,
+            )
+        } else {
+            Vec::new()
+        };
+        let mut targets = lower_repositories(
             repositories,
             &canonical_to_apparent,
             &module_edges,
-            // In query mode a toolchain is resolved, never declared, so the Go SDK repo behind
-            // `go_sdk.download(patches = ...)` is on no target's input list and the module that
-            // owns the extension stands in for it. cquery sees the resolved toolchain as a real
-            // input, so there the nodes alone carry the change and the stand-in edges would only
-            // widen the impacted set.
-            (!self.use_cquery).then_some(&extension_repos.imported),
+            (!self.use_cquery && !localize_repository_inputs).then_some(&extension_repos.imported),
             &label_only,
             &self.workspace,
             transform,
         );
+        targets.extend(coarse);
+        targets.extend(uncertain);
         Ok(BzlmodRepos {
             targets,
             failed_extensions: failed,
@@ -1318,7 +3106,7 @@ impl BazelOptions {
                     .cloned(),
             );
             complete_mappings &= mappings.len() == module_repos.len();
-            if complete_mappings && !hidden_module_repos.is_empty() {
+            if complete_mappings {
                 module_mappings.extend(module_repos.iter().cloned().zip(mappings));
             }
         }
@@ -1709,6 +3497,27 @@ impl BazelOptions {
         self.query_with(expression, use_cquery, None, &mut |_| {})
     }
 
+    /// Apply the caller's failure mode to a completed strict optional query.
+    /// A missing value keeps the ordinary graph; callers commit staged rows only for `Some`.
+    fn optional_query_result<T>(&self, result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                let incomplete = error
+                    .downcast_ref::<QueryFailure>()
+                    .is_some_and(|QueryFailure { code, stderr: _ }| matches!(*code, 3 | 7));
+                if !self.keep_going || !incomplete {
+                    return Err(error);
+                }
+                self.check_cancelled()?;
+                eprintln!(
+                    "[Warn] keeping ordinary repository fallbacks for incomplete toolchain discovery: {error:#}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     fn query_with(
         &self,
         expression: &str,
@@ -1785,8 +3594,8 @@ impl BazelOptions {
             .context("failed to execute Bazel query")?;
         let code = output.status.code().unwrap_or(-1);
         if code != 0 && !(self.keep_going && code == 3) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Bazel query failed, exit code {code}: {stderr}");
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(QueryFailure { code, stderr }.into());
         }
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
@@ -1977,8 +3786,278 @@ fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
     canonical_to_apparent
 }
 
+// A reached leaf is positive evidence. An alias cycle or missing branch prevents a completeness
+// claim, even when another branch has a real leaf.
+fn reachable_aliases(root: &str, aliases: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    let mut queue = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(label) = queue.pop() {
+        if seen.insert(label.to_owned()) {
+            queue.extend(aliases.get(label).into_iter().flatten().map(String::as_str));
+        }
+    }
+    seen
+}
+
+fn closed_aliases(
+    mut leaves: BTreeSet<String>,
+    aliases: &BTreeMap<String, BTreeSet<String>>,
+    incomplete: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    loop {
+        let before = leaves.len();
+        for (name, children) in aliases {
+            if !incomplete.contains(name) && !children.is_empty() && children.is_subset(&leaves) {
+                leaves.insert(name.clone());
+            }
+        }
+        if before == leaves.len() {
+            return leaves;
+        }
+    }
+}
+
+fn usable_toolchain_label(label: &str) -> bool {
+    label.starts_with("//")
+        || label.strip_prefix("@@").is_some_and(|s| {
+            !s.starts_with('[') && s.split_once("//").is_some_and(|(repo, _)| !repo.is_empty())
+        })
+}
+
+fn toolchain_type_keys(
+    name: &str,
+    aliases: &BTreeMap<String, BTreeSet<String>>,
+    native_types: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut leaves = reachable_aliases(name, aliases);
+    leaves.retain(|leaf| native_types.contains(leaf));
+    leaves.insert(name.to_owned());
+    leaves
+}
+
+struct Declaration {
+    ty: String,
+    bodies: BTreeSet<String>,
+    // Includes unmapped spellings so structural pruning matches the injected suffix.
+    implementation_inputs: BTreeSet<String>,
+    ordinary: BTreeSet<String>,
+    binding: [u8; 32],
+    settings: BTreeSet<String>,
+    literal: bool,
+}
+
+// Preserve order for MODULE priority, distinct declaration identities for content, and
+// only this type's potentially unavailable implementation inputs.
+#[derive(Default)]
+struct ToolchainFamily {
+    registrations: Vec<String>,
+    declarations: BTreeSet<String>,
+    missing: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct LocalToolchainInputs {
+    referrers: BTreeMap<String, BTreeSet<String>>,
+    // Existing fine rows may be walked from a confirmed matching type below the referrer.
+    resolution_roots: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct ModuleToolchainInputs {
+    complete: bool,
+    closed_types: BTreeSet<String>,
+    closed_registrations: BTreeSet<String>,
+    registration_paths: BTreeSet<String>,
+    unique_bodies: BTreeSet<String>,
+    resolution_roots: BTreeSet<String>,
+    declarations: BTreeMap<String, Declaration>,
+    aliases: BTreeMap<String, BTreeSet<String>>,
+    body_aliases: BTreeMap<String, BTreeSet<String>>,
+    incomplete: BTreeSet<String>,
+    local: BTreeSet<String>,
+    native_types: BTreeSet<String>,
+    observed: BTreeMap<String, String>,
+    families: BTreeMap<String, ToolchainFamily>,
+}
+
+impl ModuleToolchainInputs {
+    /// Only called with the native literal paths from query_registration_aliases,
+    /// before the prehash transform releases their attribute values.
+    fn record_registration_aliases(&mut self, rows: &[Target], mapping: &HashMap<String, String>) {
+        for rule in rows.iter().filter_map(|row| row.rule.as_option()) {
+            let Some(actual) = rule
+                .attribute
+                .iter()
+                .find(|attr| attr.name == "actual")
+                .and_then(|attr| attr.string_value.as_deref())
+            else {
+                continue;
+            };
+            let name = canonical_query_label(&rule.name, mapping).into_owned();
+            let destination = canonical_query_label(actual, mapping).into_owned();
+            self.aliases.insert(name, BTreeSet::from([destination]));
+        }
+        self.closed_types = closed_aliases(
+            std::mem::take(&mut self.closed_types),
+            &self.aliases,
+            &self.incomplete,
+        );
+        self.closed_registrations = closed_aliases(
+            std::mem::take(&mut self.closed_registrations),
+            &self.aliases,
+            &self.incomplete,
+        );
+    }
+
+    // Project exactly once onto the complete ordinary graph. A fallback inferred
+    // before a later literal alias or source was returned must not persist.
+    fn project(
+        &self,
+        targets: &mut [Target],
+        mut local_inputs: BTreeMap<String, BTreeSet<String>>,
+        mapping: &HashMap<String, String>,
+    ) -> (TerminalToolchains, BTreeMap<String, BTreeSet<String>>) {
+        let declarations = &self.declarations;
+        let observed = &self.observed;
+        let canonical =
+            |name: &str| canonical_query_label(main_repo_label_key(name), mapping).into_owned();
+        let body_labels: HashSet<_> = declarations
+            .values()
+            .flat_map(|d| d.bodies.iter().chain(&d.settings))
+            .collect();
+        let spelling: BTreeMap<_, _> = targets
+            .iter()
+            .filter_map(target_name)
+            .filter(|name| body_labels.contains(&canonical(name)))
+            .fold(BTreeMap::<String, String>::new(), |mut result, name| {
+                result
+                    .entry(canonical(name))
+                    .and_modify(|old| {
+                        if name < old.as_str() {
+                            *old = name.to_owned();
+                        }
+                    })
+                    .or_insert_with(|| name.to_owned());
+                result
+            });
+        let mut terminal = TerminalToolchains::default();
+        let mut missing = BTreeMap::new();
+        for row in targets.iter_mut() {
+            let Some(rule) = row.rule.as_option_mut() else {
+                continue;
+            };
+            let name = canonical(&rule.name);
+            let mut add = BTreeSet::new();
+            if let Some(declaration) = declarations.get(&name) {
+                terminal
+                    .bindings
+                    .insert(rule.name.clone(), declaration.binding);
+                let bodies: BTreeSet<_> = declaration
+                    .bodies
+                    .difference(&declaration.ordinary)
+                    .filter_map(|body| spelling.get(body).cloned())
+                    .collect();
+                if !bodies.is_empty() {
+                    terminal
+                        .implementations
+                        .insert(rule.name.clone(), bodies.into_iter().collect());
+                }
+            }
+            let local = local_inputs.remove(&rule.name).unwrap_or_default();
+            let mut suppliers: BTreeSet<_> = local
+                .iter()
+                .flat_map(|name| declarations[name].bodies.iter().cloned())
+                .collect();
+            let missing_local: BTreeSet<_> = suppliers
+                .iter()
+                .filter(|body| !spelling.contains_key(*body))
+                .cloned()
+                .collect();
+            if !missing_local.is_empty() {
+                missing
+                    .entry(rule.name.clone())
+                    .or_insert_with(BTreeSet::new)
+                    .extend(missing_local);
+            }
+            for name in &local {
+                suppliers.extend(declarations[name].settings.iter().cloned());
+            }
+            if let Some(children) = self
+                .body_aliases
+                .get(&name)
+                .or_else(|| self.aliases.get(&name))
+                .filter(|_| observed.contains_key(&name))
+            {
+                add.extend(
+                    children
+                        .iter()
+                        .map(|s| observed.get(s).unwrap_or(s).clone()),
+                );
+            }
+            if let Some(types) = rule.possible_toolchain_types.as_option() {
+                for ty in &types.label {
+                    let ty = canonical(ty);
+                    let Some(family) = self.families.get(&ty) else {
+                        continue;
+                    };
+                    for literal in &family.registrations {
+                        if let Some(spelling) = observed.get(literal) {
+                            add.insert(spelling.clone());
+                        }
+                    }
+                    for declaration in &family.declarations {
+                        suppliers.extend(declarations[declaration].bodies.iter().cloned());
+                        add.extend(
+                            declarations[declaration]
+                                .settings
+                                .iter()
+                                .map(|s| observed.get(s).unwrap_or(s).clone()),
+                        );
+                    }
+                    let bodies = &family.missing;
+                    if !bodies.is_empty() {
+                        missing
+                            .entry(rule.name.clone())
+                            .or_insert_with(BTreeSet::new)
+                            .extend(bodies.iter().cloned());
+                        suppliers.extend(bodies.iter().cloned());
+                    }
+                }
+            }
+            if !suppliers.is_empty() {
+                let mut ordinary: BTreeSet<_> = rule
+                    .rule_input
+                    .iter()
+                    .chain(&add)
+                    .map(|s| canonical(s))
+                    .collect();
+                for body in suppliers {
+                    if ordinary.insert(body.clone()) {
+                        let label = spelling.get(&body).unwrap_or(&body).clone();
+                        terminal
+                            .derived
+                            .entry(rule.name.clone())
+                            .or_default()
+                            .insert(label.clone());
+                        add.insert(label);
+                    }
+                }
+            }
+            if !add.is_empty() {
+                rule.rule_input.extend(add);
+                rule.rule_input.sort_unstable();
+                rule.rule_input.dedup();
+            }
+        }
+        (terminal, missing)
+    }
+}
+
 #[derive(Default)]
 struct ModuleSurvey {
+    precise_toolchain_inputs: bool,
+    uncertain_repos: BTreeSet<String>,
+    coarse_repos: BTreeSet<String>,
     graph: Option<Output>,
     mappings: BTreeMap<String, RepoMapping>,
 }
@@ -1995,6 +4074,53 @@ struct ExtensionRepositories {
     complete_mappings: bool,
     /// Complete module mappings from the ordinary module read, keyed by their requested canonical names.
     module_mappings: BTreeMap<String, RepoMapping>,
+}
+
+/// The existing coarse hub contract covers still-uninspected labels through the
+/// private repositories generated by that same extension usage.
+fn missing_generated_repository_inputs(
+    requested: &BTreeSet<String>,
+    extensions: &ExtensionRepositories,
+) -> BTreeMap<String, RepositoryInputs> {
+    let usages = requested
+        .intersection(&extensions.imported)
+        .filter_map(|name| extension_usage_prefix(name).map(|usage| (name, usage)))
+        .collect::<Vec<_>>();
+    let mut private_inputs: BTreeMap<_, Vec<String>> = usages
+        .iter()
+        .map(|(_, usage)| (*usage, Vec::new()))
+        .collect();
+    if private_inputs.is_empty() {
+        return BTreeMap::new();
+    }
+    for name in extensions.generated.difference(&extensions.imported) {
+        if let Some(labels) =
+            extension_usage_prefix(name).and_then(|usage| private_inputs.get_mut(usage))
+        {
+            // A root-visible generated repository is always in imported, so an
+            // unimported repository's synthetic node uses its canonical name.
+            labels.push(format!("//external:{name}"));
+        }
+    }
+    let groups: BTreeMap<_, _> = private_inputs
+        .into_iter()
+        .filter(|(_, labels)| !labels.is_empty())
+        .map(|(usage, labels)| {
+            let inputs = Arc::new(RepositoryInputGroup {
+                extension: usage.to_owned(),
+                labels,
+            });
+            (usage, inputs)
+        })
+        .collect();
+    usages
+        .into_iter()
+        .filter_map(|(repo, usage)| {
+            groups
+                .get(usage)
+                .map(|group| (repo.clone(), Arc::clone(group)))
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -2031,6 +4157,217 @@ fn canonical_query_label<'a>(label: &'a str, mapping: &HashMap<String, String>) 
     Cow::Borrowed(label)
 }
 
+fn canonical_query_repo(label: &str) -> Option<&str> {
+    let (repo, _) = label.strip_prefix("@@")?.split_once("//")?;
+    (!repo.is_empty() && !repo.starts_with('[')).then_some(repo)
+}
+
+fn fine_repository_names(
+    requested: &BTreeSet<String>,
+    mapping: &HashMap<String, String>,
+) -> HashSet<String> {
+    requested
+        .iter()
+        .map(|repo| {
+            let name = repo.trim_start_matches('@');
+            if repo.starts_with("@@") {
+                name.to_owned()
+            } else {
+                mapping.get(name).map_or(name, String::as_str).to_owned()
+            }
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct ProviderPackages {
+    // Canonical packages whose strict all-targets query completed successfully.
+    complete: BTreeSet<String>,
+    // Canonical target names actually returned by those complete inventories.
+    targets: BTreeSet<String>,
+}
+
+struct OrdinaryInputRoots<'a> {
+    start: usize,
+    named: &'a BTreeSet<String>,
+}
+
+/// Fine repositories are enumerated for hashing. Only rows reached by an
+/// ordinary input can seed additional queries outside those repositories.
+struct FineQueryRows {
+    repositories: HashSet<String>,
+    rows: HashMap<String, usize>,
+}
+
+impl FineQueryRows {
+    fn new(
+        requested: &BTreeSet<String>,
+        targets: &[Target],
+        mapping: &HashMap<String, String>,
+    ) -> Self {
+        let repositories = fine_repository_names(requested, mapping);
+        let mut fine = Self {
+            repositories,
+            rows: HashMap::new(),
+        };
+        if !fine.repositories.is_empty() {
+            for (i, row) in targets.iter().enumerate() {
+                let Some(name) = target_name(row) else {
+                    continue;
+                };
+                if fine.contains(name, mapping) {
+                    let label = canonical_query_label(name, mapping);
+                    fine.rows.insert(label.into_owned(), i);
+                }
+            }
+        }
+        fine
+    }
+
+    fn contains(&self, label: &str, mapping: &HashMap<String, String>) -> bool {
+        label
+            .strip_prefix('@')
+            .and_then(|name| name.split_once("//"))
+            .is_some_and(|(repo, _)| {
+                let repo = repo
+                    .strip_prefix('@')
+                    .unwrap_or_else(|| mapping.get(repo).map_or(repo, String::as_str));
+                self.repositories.contains(repo)
+            })
+    }
+
+    fn reached(
+        &self,
+        targets: &[Target],
+        roots: &[Target],
+        named: &BTreeSet<String>,
+        mapping: &HashMap<String, String>,
+        visited: &mut HashSet<usize>,
+    ) -> Vec<usize> {
+        let mut queue = Vec::new();
+        if self.rows.is_empty() {
+            return queue;
+        }
+        let mut enqueue = |input: &str, queue: &mut Vec<usize>| {
+            if !self.contains(input, mapping) {
+                return;
+            }
+            let label = canonical_query_label(input, mapping);
+            if let Some(&i) = self.rows.get(label.as_ref()) {
+                if visited.insert(i) {
+                    queue.push(i);
+                }
+            }
+        };
+        for input in named {
+            enqueue(input, &mut queue);
+        }
+        for row in roots {
+            let Some(name) = target_name(row) else {
+                continue;
+            };
+            if !main_repo_label_key(name).starts_with("//external:")
+                && !self.contains(name, mapping)
+            {
+                for input in target_inputs(row) {
+                    enqueue(input, &mut queue);
+                }
+            }
+        }
+        let mut cursor = 0;
+        while cursor < queue.len() {
+            let index = queue[cursor];
+            for input in target_inputs(&targets[index]) {
+                enqueue(input, &mut queue);
+            }
+            cursor += 1;
+        }
+        queue
+    }
+}
+
+/// Record missing ordinary references before supplier inputs are added. The caller later removes
+/// returned targets and references from fine rows that remain unreached after supplier discovery.
+fn unrepresented_coarse_inputs(
+    targets: &[Target],
+    primary_len: usize,
+    requested: &BTreeSet<String>,
+    mapping: &HashMap<String, String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let fine = fine_repository_names(requested, mapping);
+    let present: HashSet<_> = targets
+        .iter()
+        .filter_map(target_name)
+        .filter_map(|name| {
+            let label = canonical_query_label(name, mapping);
+            canonical_query_repo(&label)
+                .is_some_and(|repo| !fine.contains(repo))
+                .then_some(label)
+        })
+        .collect();
+    let mut inputs = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in &targets[..primary_len] {
+        let Some(rule) = row.rule.as_option() else {
+            continue;
+        };
+        // The structural survey supplies native declarations' genuine ordinary prefix later.
+        if rule.rule_class_key.as_deref() == Some("toolchain")
+            || main_repo_label_key(&rule.name).starts_with("//external:")
+        {
+            continue;
+        }
+        for input in &rule.rule_input {
+            let name = canonical_query_label(input, mapping);
+            let Some(repo) = canonical_query_repo(&name) else {
+                continue;
+            };
+            if fine.contains(repo) || present.contains(name.as_ref()) {
+                continue;
+            }
+            inputs
+                .entry(rule.name.clone())
+                .or_default()
+                .insert(name.into_owned());
+        }
+    }
+    inputs
+}
+
+fn eligible_coarse_inputs(
+    candidates: &BTreeMap<String, BTreeSet<String>>,
+    targets: &[Target],
+    fine: &FineQueryRows,
+    named: &BTreeSet<String>,
+    mapping: &HashMap<String, String>,
+    returned: &HashSet<String>,
+    closed_types: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let reached = fine.reached(targets, targets, named, mapping, &mut HashSet::new());
+    let reached_names: HashSet<_> = reached
+        .into_iter()
+        .filter_map(|index| target_name(&targets[index]))
+        .collect();
+    candidates
+        .iter()
+        .filter_map(|(owner, labels)| {
+            if fine.contains(owner, mapping) && !reached_names.contains(owner.as_str()) {
+                return None;
+            }
+            let labels: BTreeSet<_> = labels
+                .iter()
+                .filter(|label| {
+                    canonical_query_repo(label).is_some()
+                        && !returned.contains(*label)
+                        && !closed_types.contains(*label)
+                        && !fine.contains(label, mapping)
+                })
+                .cloned()
+                .collect();
+            (!labels.is_empty()).then(|| (owner.clone(), labels))
+        })
+        .collect()
+}
+
 fn target_inputs(target: &Target) -> impl Iterator<Item = &String> {
     target
         .rule
@@ -2045,12 +4382,34 @@ fn target_inputs(target: &Target) -> impl Iterator<Item = &String> {
         )
 }
 
+fn has_toolchain_demand(targets: &[Target]) -> bool {
+    targets
+        .iter()
+        .filter_map(|row| row.rule.as_option())
+        .any(|rule| {
+            rule.possible_toolchain_types
+                .as_option()
+                .is_some_and(|types| !types.label.is_empty())
+        })
+}
+
 fn query_set(labels: &BTreeSet<String>) -> Result<String> {
     let operands = labels
         .iter()
         .map(|label| query_labels(std::iter::once(label)))
         .collect::<Result<Vec<_>>>()?;
     Ok(format!("set({})", operands.join(" ")))
+}
+
+/// Separate siblings calls keep packages with the same path in different repositories distinct.
+fn query_siblings<'a>(labels: impl Iterator<Item = &'a String>) -> Result<String> {
+    let expressions = labels
+        .map(|label| query_labels(std::iter::once(label)).map(|label| format!("siblings({label})")))
+        .collect::<Result<Vec<_>>>()?;
+    if expressions.is_empty() {
+        return Ok("set()".into());
+    }
+    Ok(format!("({})", expressions.join(" + ")))
 }
 
 /// Coverage of the retained primary targets followed by any accepted supplement.
@@ -2554,7 +4913,16 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
 }
 
 #[derive(Clone, Default)]
+pub(crate) struct TerminalToolchains {
+    pub(crate) precise: bool,
+    pub(crate) implementations: BTreeMap<String, Vec<String>>,
+    pub(crate) bindings: BTreeMap<String, [u8; 32]>,
+    pub(crate) derived: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Clone, Default)]
 pub(crate) struct ScopedSources {
+    pub(crate) terminal: TerminalToolchains,
     pub(crate) repositories: BTreeSet<String>,
     pub(crate) repository_inputs: BTreeSet<String>,
     pub(crate) queried_files: HashSet<String>,
@@ -2682,11 +5050,135 @@ fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryI
     }
 }
 
+/// Additional coarse evidence follows the imported repositories of the named module or private
+/// repositories of the named generated hub's own extension usage. The caller attaches these groups
+/// to the unresolved referrers, leaving shared repository identities independent.
+fn coarse_repository_targets(
+    requested: &BTreeSet<String>,
+    extensions: &ExtensionRepositories,
+    names: &BTreeMap<String, Vec<String>>,
+    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
+) -> Vec<Target> {
+    let mut groups = missing_generated_repository_inputs(requested, extensions);
+    for repo in requested {
+        if is_extension_repo(repo) {
+            continue;
+        }
+        let Some(mapping) = extensions.module_mappings.get(repo) else {
+            continue;
+        };
+        let labels: BTreeSet<_> = mapping
+            .values()
+            .filter(|canonical| extensions.imported.contains(*canonical))
+            .flat_map(|canonical| {
+                names
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| vec![canonical.clone()])
+            })
+            .map(|name| format!("//external:{name}"))
+            .collect();
+        if !labels.is_empty() {
+            groups.insert(
+                repo.clone(),
+                Arc::new(RepositoryInputGroup {
+                    extension: format!("!coarse-{repo}"),
+                    labels: labels.into_iter().collect(),
+                }),
+            );
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(repo, inputs)| {
+            let rule = Rule {
+                rule_class: "repository".into(),
+                ..Default::default()
+            };
+            let mut target = repository_target(rule, &format!("!coarse-{repo}"), &BTreeSet::new());
+            transform(&mut target, Some(inputs));
+            target
+        })
+        .collect()
+}
+
+/// Keep unresolved supplier or forwarding inputs on their actual referrers. Related
+/// readers share one immutable set of repository labels; normal repository nodes
+/// retain only their definitions and declared module dependencies.
+fn uncertain_repository_targets(
+    requested: &BTreeSet<String>,
+    repositories: &[Repository],
+    names: &BTreeMap<String, Vec<String>>,
+    dependencies: &BTreeMap<String, BTreeSet<String>>,
+    transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
+) -> Vec<Target> {
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let repos: BTreeSet<_> = repositories
+        .iter()
+        .filter_map(|r| r.canonical_name.as_deref())
+        .collect();
+    let modules: BTreeMap<_, _> = repos
+        .iter()
+        .copied()
+        .filter(|r| !is_extension_repo(r))
+        .map(|r| (r.to_owned(), r.split('+').next().unwrap_or(r).to_owned()))
+        .collect();
+    let owner = |repo: &str| -> String {
+        if modules.contains_key(repo) {
+            return modules[repo].clone();
+        }
+        extension_usage_prefix(repo)
+            .and_then(|prefix| extension_repo_owner(prefix, &modules))
+            .map_or_else(
+                || extension_usage_prefix(repo).unwrap_or(repo).to_owned(),
+                |(_, name)| name.clone(),
+            )
+    };
+    let mut groups = BTreeMap::new();
+    let mut result = Vec::new();
+    for repo in requested {
+        let start = owner(repo);
+        let shared = groups.entry(start.clone()).or_insert_with(|| {
+            let mut pending = vec![start.clone()];
+            let mut related = BTreeSet::new();
+            while let Some(module) = pending.pop() {
+                if related.insert(module.clone()) {
+                    pending.extend(dependencies.get(&module).into_iter().flatten().cloned());
+                }
+            }
+            let mut labels = BTreeSet::new();
+            for canonical in &repos {
+                if related.contains(&owner(canonical)) {
+                    if let Some(apparent) = names.get(*canonical) {
+                        labels.extend(apparent.iter().map(|r| format!("//external:{r}")));
+                    } else {
+                        labels.insert(format!("//external:{canonical}"));
+                    }
+                }
+            }
+            Arc::new(RepositoryInputGroup {
+                extension: format!("!unobserved-{start}"),
+                labels: labels.into_iter().collect(),
+            })
+        });
+        let rule = Rule {
+            rule_class: "repository".into(),
+            ..Default::default()
+        };
+        let mut target = repository_target(rule, &format!("!unobserved-{repo}"), &BTreeSet::new());
+        transform(&mut target, Some(Arc::clone(shared)));
+        result.push(target);
+    }
+    result
+}
+
 fn lower_repositories(
     mut repositories: Vec<Repository>,
     canonical_to_apparent: &BTreeMap<String, Vec<String>>,
     module_edges: &BTreeMap<String, BTreeSet<String>>,
-    extension_edges: Option<&BTreeSet<String>>,
+    imported: Option<&BTreeSet<String>>,
     label_only: &LabelOnlyRepositories,
     workspace: &Path,
     transform: &mut impl FnMut(&mut Target, Option<RepositoryInputs>),
@@ -2749,7 +5241,7 @@ fn lower_repositories(
     // the hub-to-spoke inputs and the owner's edges to other generators remain.
     let mut module_extension_repos = BTreeMap::<String, BTreeSet<String>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
-    if let Some(imported) = extension_edges {
+    if let Some(imported) = imported {
         for repository in &repositories {
             let canonical = repository.canonical_name.as_deref().unwrap_or_default();
             let Some(extension) = extension_usage_prefix(canonical) else {
@@ -2799,7 +5291,7 @@ fn lower_repositories(
             dependencies.extend(repos.iter().cloned());
         }
         let spokes = extension
-            .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
+            .filter(|_| imported.is_some_and(|imported| imported.contains(canonical)))
             .and_then(|extension| extension_spokes.get_key_value(extension));
         let group = if dependencies.is_empty() {
             spokes
@@ -3338,6 +5830,24 @@ fn lower_target(mut target: Target) -> Option<Target> {
     }
 }
 
+// Keep missing select values visible to callers that need a complete binding.
+fn scalar_label_values(attribute: &Attribute) -> impl Iterator<Item = Option<&str>> {
+    attribute
+        .string_value
+        .as_deref()
+        .into_iter()
+        .map(Some)
+        .chain(
+            attribute
+                .selector_list
+                .as_option()
+                .into_iter()
+                .flat_map(|list| &list.elements)
+                .flat_map(|selector| &selector.entries)
+                .map(|entry| entry.string_value.as_deref()),
+        )
+}
+
 fn compact_target(target: &mut Target) {
     target.__buffa_unknown_fields.clear();
     match target.r#type {
@@ -3351,7 +5861,10 @@ fn compact_target(target: &mut Target) {
             rule.DEPRECATED_public_by_default = None;
             rule.DEPRECATED_is_skylark = None;
             rule.definition_stack.clear();
-            if rule.rule_class_key.as_deref() != Some("alias") {
+            if !matches!(
+                rule.rule_class_key.as_deref(),
+                Some("alias" | "filegroup" | "toolchain" | "toolchain_type")
+            ) {
                 rule.rule_class_key = None;
             }
             rule.__buffa_unknown_fields.clear();
@@ -6702,6 +9215,13 @@ exit 1
         let body = format!(
             r#"#!/bin/sh
 args="$*"
+if [ -f capable-graph ]; then
+  case "$args" in
+    *"help mod"*) echo include_toolchain_registrations; exit 0 ;;
+    *"query set() --proto:possible_toolchain_types"*) exit 0 ;;
+    *"mod graph --output=json --include_toolchain_registrations"*) cat capable-graph; exit 0 ;;
+  esac
+fi
 if echo "$args" | grep -q "mod graph --output=json"; then
   printf '{{"modules":["m"]}}\n'
   exit 0
@@ -6756,6 +9276,17 @@ exit 1
             .chars()
             .all(|character| character.is_ascii_hexdigit()));
         assert!(selected_repos_marker.is_file());
+        // The same binary path, version and repository state can expose a different query model.
+        let graph = workspace.path().join("capable-graph");
+        fs::write(
+            &graph,
+            r#"{"modules":["m"],"moduleToolchainRegistrations":[]}"#,
+        )
+        .unwrap();
+        let capable = options.dependency_fingerprint().unwrap();
+        assert_ne!(capable, fingerprint);
+        fs::write(&graph, r#"{"modules":["m"]}"#).unwrap();
+        assert!(options.dependency_fingerprint().is_err());
     }
 
     #[test]
@@ -7474,9 +10005,23 @@ exit 1
         let partial = tempfile::tempdir().unwrap();
         let script = query_script(partial.path(), "8.7.0", &[], 3);
         let mut options = probe_options(partial.path(), script);
-        let error = options.query("//app:all", false).unwrap_err().to_string();
-        assert!(error.contains("Bazel query failed, exit code 3"), "{error}");
+        let error = options.query("//app:all", false).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Bazel query failed, exit code 3"),
+            "{message}"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<QueryFailure>()
+                .map(|QueryFailure { code, stderr: _ }| *code),
+            Some(3)
+        );
         options.keep_going = true;
+        let optional = options
+            .optional_query_result::<Vec<Target>>(Err(error))
+            .unwrap();
+        assert!(optional.is_none());
         let targets = options.query("//app:all", false).unwrap();
         assert_eq!(
             targets.iter().filter_map(target_name).collect::<Vec<_>>(),

@@ -3,9 +3,7 @@ use crate::cache;
 use crate::cancel::{Cancellation, CANCELLED};
 use crate::git::{self, DerivationPolicy, Git};
 use crate::hash::{generate_hashes_timed, HashOptions};
-use crate::model::{
-    filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
-};
+use crate::model::{filter_and_sort_labels, impacted_targets, HashFileData};
 use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
 use crate::web_identity::WebIdentitySessions;
@@ -1686,6 +1684,7 @@ fn compute_query(
     )?;
     let to_profile = retrieval_profile(&to_sha, &to, to_started);
     let to = to.data;
+    from.ensure_toolchain_mode_matches(&to)?;
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
     let bazel = state.bazel_options();
@@ -1699,16 +1698,17 @@ fn compute_query(
         for label in impacted.difference(&hash_impacted) {
             distance_from.remove(label);
         }
-        serde_json::to_value(impacted_targets_with_distances(
+        serde_json::to_value(crate::model::impacted_with_terminal_distances(
             &distance_from,
             &to.hashes,
             &to.dep_edges,
+            &to.toolchain_implementations,
             inputs.target_types.as_ref(),
             exclude_external,
         )?)?
     } else {
         serde_json::to_value(filter_and_sort_labels(
-            impacted,
+            crate::model::include_toolchain_registrations(impacted, &to),
             &from.hashes,
             &to.hashes,
             inputs.target_types.as_ref(),

@@ -216,6 +216,8 @@ impl Serialize for SerializedMetadata<'_> {
             "HashMetadata",
             usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
+                + usize::from(self.data.module_toolchain_inputs)
+                + usize::from(!self.data.toolchain_implementations.is_empty())
                 + usize::from(self.data.dependency_fingerprint.is_some())
                 + usize::from(self.data.partial.is_some())
                 + usize::from(self.data.tree.is_some()),
@@ -225,6 +227,15 @@ impl Serialize for SerializedMetadata<'_> {
         }
         if let Some(dependency_fingerprint) = &self.data.dependency_fingerprint {
             state.serialize_field("dependencyFingerprint", dependency_fingerprint)?;
+        }
+        if self.data.module_toolchain_inputs {
+            state.serialize_field("moduleToolchainInputs", &true)?;
+        }
+        if !self.data.toolchain_implementations.is_empty() {
+            state.serialize_field(
+                "toolchainImplementations",
+                &self.data.toolchain_implementations,
+            )?;
         }
         if include_dep_edges {
             state.serialize_field("depEdges", &self.data.dep_edges)?;
@@ -258,6 +269,8 @@ impl Serialize for SerializedHashFile<'_> {
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
             && self.data.tree.is_none()
+            && !self.data.module_toolchain_inputs
+            && self.data.toolchain_implementations.is_empty()
             && (!self.include_deps || self.data.dep_edges.is_empty())
         {
             return hashes.serialize(serializer);
@@ -281,6 +294,9 @@ pub struct HashFileData {
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
+    /// The ordinary query used declared reader types and MODULE registration evidence.
+    pub module_toolchain_inputs: bool,
+    pub toolchain_implementations: BTreeMap<String, Vec<String>>,
     /// Partial-graph mode (`--partialGraph`): the recipes a derivation re-evaluates.
     pub partial: Option<PartialRecipes>,
     /// Partial-graph mode: the id of the git tree the hashes describe, the base of a later
@@ -394,6 +410,10 @@ struct Metadata {
     #[serde(default)]
     dep_edges: BTreeMap<String, Vec<String>>,
     #[serde(default)]
+    module_toolchain_inputs: bool,
+    #[serde(default)]
+    toolchain_implementations: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     partial_graph: Option<PartialRecipes>,
     #[serde(default)]
     tree: Option<String>,
@@ -429,6 +449,8 @@ impl<'de> Deserialize<'de> for HashFileData {
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
+                            data.module_toolchain_inputs = metadata.module_toolchain_inputs;
+                            data.toolchain_implementations = metadata.toolchain_implementations;
                             data.partial = metadata.partial_graph;
                             data.tree = metadata.tree;
                         }
@@ -465,6 +487,13 @@ impl HashFileData {
         }
     }
 
+    pub fn ensure_toolchain_mode_matches(&self, other: &Self) -> Result<()> {
+        if self.module_toolchain_inputs != other.module_toolchain_inputs {
+            bail!("the starting and final hashes use different MODULE toolchain input modes; regenerate both in one model before comparing them");
+        }
+        Ok(())
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = fs::read(path)
             .with_context(|| format!("failed to read hash file {}", path.display()))?;
@@ -494,6 +523,8 @@ impl HashFileData {
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
             && self.tree.is_none()
+            && !self.module_toolchain_inputs
+            && self.toolchain_implementations.is_empty()
             && (!include_deps || self.dep_edges.is_empty())
         {
             return Value::Object(hashes);
@@ -509,6 +540,15 @@ impl HashFileData {
             metadata.insert(
                 "dependencyFingerprint".to_owned(),
                 Value::String(dependency_fingerprint.clone()),
+            );
+        }
+        if self.module_toolchain_inputs {
+            metadata.insert("moduleToolchainInputs".into(), Value::Bool(true));
+        }
+        if !self.toolchain_implementations.is_empty() {
+            metadata.insert(
+                "toolchainImplementations".to_owned(),
+                serde_json::json!(self.toolchain_implementations),
             );
         }
         if include_deps && !self.dep_edges.is_empty() {
@@ -576,6 +616,25 @@ fn accepts(
         );
     }
     Ok(target_types.contains(&hash.kind))
+}
+
+/// Add a registration as a terminal result. A registration reported via its
+/// implementation is not itself a changed input for another target.
+pub fn include_toolchain_registrations(
+    mut changed: std::collections::BTreeSet<String>,
+    to: &HashFileData,
+) -> std::collections::BTreeSet<String> {
+    let extra: Vec<_> = to
+        .toolchain_implementations
+        .iter()
+        .filter(|(label, implementations)| {
+            to.hashes.contains_key(*label)
+                && implementations.iter().any(|body| changed.contains(body))
+        })
+        .map(|(label, _)| label.clone())
+        .collect();
+    changed.extend(extra);
+    changed
 }
 
 pub fn impacted_targets(
@@ -711,6 +770,24 @@ pub fn impacted_targets_with_distances(
     target_types: Option<&HashSet<String>>,
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
+    impacted_with_terminal_distances(
+        from,
+        to,
+        dep_edges,
+        &BTreeMap::new(),
+        target_types,
+        exclude_external,
+    )
+}
+
+pub fn impacted_with_terminal_distances(
+    from: &BTreeMap<String, TargetHash>,
+    to: &BTreeMap<String, TargetHash>,
+    dep_edges: &BTreeMap<String, Vec<String>>,
+    terminals: &BTreeMap<String, Vec<String>>,
+    target_types: Option<&HashSet<String>>,
+    exclude_external: bool,
+) -> Result<Vec<ImpactedTargetWithDistance>> {
     let impact_types = impacted_types(from, to);
     let mut dependents = HashMap::<&str, Vec<&str>>::new();
     let mut roots = Vec::new();
@@ -762,17 +839,52 @@ pub fn impacted_targets_with_distances(
             "[Warn] {count} indirectly impacted targets have no path to a direct change or a target with missing changed dependencies, including {representative}; falling back to distance 0"
         );
     }
+    let ordinary_distance =
+        |label: &str| match (target_distances.get(label), package_distances.get(label)) {
+            (Some(target), Some(package)) => Some((*target, *package)),
+            (None, None) => impact_types.contains_key(label).then_some((0, 0)),
+            _ => unreachable!("both distance walks use the same graph and origins"),
+        };
+    // Take implementation distances from the completed ordinary traversal. Each
+    // declaration may be reported once; no reporting edge is traversed by a holder.
+    let mut reported = HashMap::new();
+    for (label, implementations) in terminals {
+        if !to.contains_key(label) {
+            continue;
+        }
+        let mut distances = ordinary_distance(label);
+        for body in implementations {
+            if let Some((target, packages)) = ordinary_distance(body) {
+                let same_package = label.split(':').next() == body.split(':').next();
+                let via = (
+                    target.saturating_add(1),
+                    packages.saturating_add(usize::from(!same_package)),
+                );
+                let current = distances.get_or_insert(via);
+                current.0 = current.0.min(via.0);
+                current.1 = current.1.min(via.1);
+            }
+        }
+        if let Some(distance) = distances {
+            reported.insert(label.as_str(), distance);
+        }
+    }
     let impacted = impact_types
         .keys()
         .map(String::as_str)
+        .chain(
+            reported
+                .keys()
+                .copied()
+                .filter(|label| !impact_types.contains_key(*label)),
+        )
         .filter(|label| !exclude_external || !label.starts_with("//external:"))
         .filter_map(|label| {
-            let (target_distance, package_distance) =
-                match (target_distances.get(label), package_distances.get(label)) {
-                    (Some(target), Some(package)) => (*target, *package),
-                    (None, None) => (0, 0),
-                    _ => unreachable!("both distance walks use the same graph and origins"),
-                };
+            let (target_distance, package_distance) = reported
+                .get(label)
+                .copied()
+                .or_else(|| ordinary_distance(label))
+                .expect("ordinary or terminal impact");
             match accepts(label, to, target_types) {
                 Ok(true) => Some(Ok(ImpactedTargetWithDistance {
                     label: label.to_owned(),
@@ -786,8 +898,7 @@ pub fn impacted_targets_with_distances(
         .collect::<Result<Vec<_>>>()?;
     // Rank each label once and sort the pairs. A key closure would look the label up in both maps
     // and clone it on every comparison: O(n log n) lookups and allocations for an n-label result.
-    // The labels are distinct (they are the memo's keys), so an unstable sort orders them exactly
-    // as a stable one would.
+    // The labels are distinct, so an unstable sort orders them exactly as a stable one would.
     let mut ranked = impacted
         .into_iter()
         .map(|target| {

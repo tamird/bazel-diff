@@ -288,18 +288,64 @@ fn hash_targets_with_digests(
     let hash_started = Instant::now();
     let mut external_resolver =
         ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
+    let mut scoped_sources = scoped_sources;
+    let mut definition_digests = definition_digests;
+    if !options.ignored_attributes.contains("toolchain") {
+        for (name, digest) in &scoped_sources.terminal.bindings {
+            if let Some(id) = definition_digests.ids.get(name) {
+                if let Some(prepared) = &mut definition_digests.prepared[*id] {
+                    let mut builder = Sha256::new();
+                    builder.update(prepared.definition_digest);
+                    builder.update(digest);
+                    prepared.definition_digest = builder.finalize().into();
+                }
+            }
+        }
+    }
+    if !scoped_sources.terminal.derived.is_empty() {
+        let mapping = external_resolver.canonical_repo_nodes();
+        for rule in targets.iter().filter_map(|row| row.rule.as_option()) {
+            let Some(derived) = scoped_sources.terminal.derived.get_mut(&rule.name) else {
+                continue;
+            };
+            let mut possible = BTreeSet::new();
+            let mut ordinary = BTreeSet::new();
+            for name in &rule.rule_input {
+                if let Cow::Owned(repo) = transform_external_input(
+                    name,
+                    &options.bazel.fine_grained_external_repos,
+                    mapping,
+                ) {
+                    if derived.contains(name) {
+                        possible.insert(repo);
+                    } else {
+                        ordinary.insert(repo);
+                    }
+                }
+            }
+            derived.extend(
+                possible
+                    .into_iter()
+                    .filter(|repo| !ordinary.contains(repo) && !rule.rule_input.contains(repo)),
+            );
+        }
+    }
+    let module_toolchain_inputs = scoped_sources.terminal.precise;
+    let terminal_implementations = std::mem::take(&mut scoped_sources.terminal.implementations);
     external_resolver.scoped_sources = scoped_sources;
     let module_graph_started = Instant::now();
     let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
     options.bazel.check_cancelled()?;
     let module_graph_millis = elapsed_millis(module_graph_started);
-    let data = hash_targets_with_environment(
+    let mut data = hash_targets_with_environment(
         options,
         targets,
         definition_digests,
         external_resolver,
         module_graph_json,
     )?;
+    data.module_toolchain_inputs = module_toolchain_inputs;
+    data.toolchain_implementations = terminal_implementations;
     let timings = GenerationTimings {
         bazel_query_millis: 0,
         module_graph_millis,
@@ -676,7 +722,9 @@ fn hash_targets_with_environment(
         // The traversal above only recorded the recipes; the hashes an entry in this mode
         // carries are what evaluating them yields, so a later derivation from this entry
         // computes exactly the same values.
-        let recipes = recorder.finish();
+        let mut recipes = recorder.finish();
+        recipes.configuration_fingerprint =
+            crate::cache::configuration_fingerprint(options, false, true);
         let targets = hashes
             .iter()
             .map(|(label, hash)| (label.clone(), hash.kind.clone()))
@@ -689,6 +737,8 @@ fn hash_targets_with_environment(
         module_graph_json,
         dependency_fingerprint: None,
         dep_edges,
+        module_toolchain_inputs: false,
+        toolchain_implementations: BTreeMap::new(),
         partial,
         tree: options
             .partial_tree
@@ -1136,7 +1186,17 @@ impl HashContext<'_> {
                 .input_positions
                 .as_ref()
                 .and_then(|ids| ids.get(position).copied().flatten());
-            builder.direct(encoded_input.as_bytes());
+            if !self
+                .source_hasher
+                .external_resolver
+                .scoped_sources
+                .terminal
+                .derived
+                .get(canonical_key)
+                .is_some_and(|names| names.contains(encoded_input.as_ref()))
+            {
+                builder.direct(encoded_input.as_bytes());
+            }
             let input_label = target_label(&encoded_input);
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
                 Some(Input::Source(digest)) => builder.source(input_label, digest),
