@@ -1,0 +1,3 @@
+module(name = "transition_registration_holder")
+
+register_toolchains("//:default_registration", "//:available")

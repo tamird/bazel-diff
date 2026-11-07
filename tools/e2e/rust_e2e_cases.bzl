@@ -160,6 +160,22 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::opaque_import_follows_the_used_hidden_alias_and_source",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::ordinary_filegroup_honors_an_ignored_output_group",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::provider_enrichment_does_not_fetch_an_unselected_alias_branch",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::registered_implementations_can_live_in_other_reached_packages",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::remote_proto_bump_impacts_consumer",
                 "timeout": "moderate",
             },
@@ -168,7 +184,27 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::same_type_registrations_preserve_the_selected_foreign_payload",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::selected_tool_consumes_a_file_from_another_extension",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::stock_query_recovers_a_toolchain_reference_masked_by_an_ordinary_attribute",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::toolchain_declarations_follow_their_implementations",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::transition_registration_alias_only_reaches_matching_readers",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::transition_registration_holder_depends_on_the_binding",
                 "timeout": "moderate",
             },
             {
@@ -177,6 +213,18 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "external::transitive_external_repo_change_reaches_consumer_cquery",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::two_typed_spokes_keep_independent_partial_impacts",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::unavailable_toolchain_body_changes_the_reader_and_spares_the_holder",
+                "timeout": "moderate",
+            },
+            {
+                "name": "external::unresolved_import_keeps_a_hidden_tool_without_an_ordinary_owner_input",
                 "timeout": "moderate",
             },
             {

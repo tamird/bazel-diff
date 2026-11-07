@@ -18,7 +18,30 @@ use std::time::Instant;
 use tempfile::NamedTempFile;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct BazelVersion(u32, u32, u32);
+pub(crate) struct BazelVersion(u32, u32, u32);
+
+enum QueryFormat {
+    Ordinary { keep_class_keys: bool },
+    Configured,
+    Walked,
+}
+
+#[derive(Debug)]
+struct QueryFailure {
+    code: Option<i32>,
+    stderr: String,
+}
+impl std::fmt::Display for QueryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Bazel query failed, exit code {}: {}",
+            self.code.unwrap_or(-1),
+            self.stderr
+        )
+    }
+}
+impl std::error::Error for QueryFailure {}
 
 /// The flag that decides whether the `//external` package exists.
 const WORKSPACE_FLAG: &str = "enable_workspace";
@@ -147,9 +170,9 @@ impl BazelOptions {
         &self,
         supported: bool,
         survey: &mut ModuleSurvey,
-    ) -> (bool, Option<Vec<u8>>) {
+    ) -> Result<(bool, Option<Vec<u8>>)> {
         if supported && self.workspace.join("MODULE.bazel").is_file() {
-            survey.graph = self.run_capture(&["mod", "graph", "--output=json"]).ok();
+            (survey.graph, survey.toolchain_registrations) = self.module_graph_output()?;
             if let Some(prefetched) = survey
                 .graph
                 .as_ref()
@@ -157,10 +180,10 @@ impl BazelOptions {
             {
                 let (root, mappings) = prefetched;
                 survey.mappings = mappings;
-                return (true, Some(root));
+                return Ok((true, Some(root)));
             }
         }
-        self.probe_bzlmod()
+        Ok(self.probe_bzlmod())
     }
 
     fn prefetch_module_mappings(
@@ -204,10 +227,195 @@ impl BazelOptions {
     /// by the hashing pass, so this one takes the partial answer silently.
     pub fn module_graph_json(&self) -> Option<String> {
         let output = self.run_capture(&["mod", "graph", "--output=json"]).ok()?;
+        Self::answered_module_graph(output)
+    }
+
+    fn answered_module_graph(output: Output) -> Option<String> {
         let answered = output.status.success()
             || extension_failure(&String::from_utf8_lossy(&output.stderr))
                 .is_some_and(|failure| failure.answered);
         answered.then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    fn optional_toolchain_response(&self, args: &[&str]) -> Result<Option<Output>> {
+        let output = match self.run_capture(args) {
+            Ok(output) => output,
+            Err(error) => {
+                self.check_cancelled()?;
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+                {
+                    return Err(error);
+                }
+                if self.verbose {
+                    eprintln!("[Warn] Optional toolchain input is unavailable: {error:#}");
+                }
+                return Ok(None);
+            }
+        };
+        self.check_cancelled()?;
+        // Bazel uses exit code 8 for interruption; a signal has no exit code.
+        if matches!(output.status.code(), None | Some(8)) {
+            bail!("Bazel toolchain input acquisition was interrupted");
+        }
+        Ok(Some(output))
+    }
+
+    fn optional_toolchain_output(&self, args: &[&str]) -> Result<Option<Output>> {
+        Ok(self.optional_toolchain_response(args)?.filter(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stderr).contains("ERROR:")
+        }))
+    }
+
+    /// Query-only repository or configuration overrides are not applied to the module survey.
+    /// Static supplier evidence is available only when command options change serialization.
+    pub(crate) fn static_toolchain_scope_matches(&self) -> bool {
+        self.isolated_dependency_root.is_none()
+            && self.command_options.iter().all(|option| {
+                option.starts_with("--proto:")
+                    || option.starts_with("--noproto:")
+                    || option == "--consistent_labels"
+                    || option.starts_with("--order_output=")
+                    || option.starts_with("--curses=")
+                    || option == "--nokeep_going"
+            })
+    }
+
+    pub(crate) fn can_use_observed_inputs(&self) -> bool {
+        if self.use_cquery
+            || self.keep_going
+            || !self.static_toolchain_scope_matches()
+            || self
+                .exclude_targets_query
+                .as_deref()
+                .is_some_and(|exclude| !exclude.trim().is_empty())
+        {
+            return false;
+        }
+        // Bazel applies the last Boolean option. Suppressed ordinary inputs cannot
+        // establish the named boundaries used by supplier subscriptions.
+        let ordinary_inputs =
+            self.command_options
+                .iter()
+                .rev()
+                .find_map(|option| match option.as_str() {
+                    "--noproto:rule_inputs_and_outputs" => Some(false),
+                    "--proto:rule_inputs_and_outputs" => Some(true),
+                    other => other
+                        .strip_prefix("--proto:rule_inputs_and_outputs=")
+                        .map(|value| {
+                            ["true", "1", "yes", "t", "y"]
+                                .iter()
+                                .any(|enabled| value.eq_ignore_ascii_case(enabled))
+                        }),
+                });
+        ordinary_inputs != Some(false)
+    }
+
+    /// A successful enhanced response contains the ordinary graph plus one registration field.
+    /// Reuse any answered ordinary graph for parsed consumers, while registration evidence
+    /// requires a complete response. Otherwise use the ordinary command without changing the
+    /// raw-output fingerprint path above.
+    fn module_graph_output(
+        &self,
+    ) -> Result<(Option<Output>, Option<ModuleToolchainRegistrations>)> {
+        if !self.use_cquery && self.static_toolchain_scope_matches() {
+            if let Some(output) = self.optional_toolchain_response(&[
+                "mod",
+                "graph",
+                "--output=json",
+                "--include_toolchain_registrations",
+            ])? {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let complete = output.status.success() && !stderr.contains("ERROR:");
+                let answered =
+                    complete || extension_failure(&stderr).is_some_and(|failure| failure.answered);
+                if answered {
+                    if let Ok(graph) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        if graph.get("key").and_then(serde_json::Value::as_str) == Some("<root>")
+                            && graph
+                                .get("dependencies")
+                                .is_some_and(serde_json::Value::is_array)
+                        {
+                            let registrations = complete
+                                .then(|| ModuleToolchainRegistrations::from_graph(&graph))
+                                .flatten();
+                            return Ok((Some(output), registrations));
+                        }
+                    }
+                }
+            }
+        }
+        let output = match self.run_capture(&["mod", "graph", "--output=json"]) {
+            Ok(output) => Some(output),
+            Err(error) => {
+                self.check_cancelled()?;
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
+                {
+                    return Err(error);
+                }
+                None
+            }
+        };
+        self.check_cancelled()?;
+        if output
+            .as_ref()
+            .is_some_and(|output| matches!(output.status.code(), None | Some(8)))
+        {
+            bail!("Bazel module graph acquisition was interrupted");
+        }
+        Ok((output, None))
+    }
+
+    /// This is a graph-mode choice for the whole ordinary query. A missing
+    /// individual declaration or rule never changes how other edges are hashed.
+    fn uses_declared_types(&self) -> bool {
+        self.command_options
+            .iter()
+            .rev()
+            .find_map(|option| {
+                let (flag, value) = option.split_once('=').unwrap_or((option, "true"));
+                match flag {
+                    "--proto:possible_toolchain_types" => Some(
+                        ["true", "t", "yes", "y", "1"]
+                            .iter()
+                            .any(|yes| value.eq_ignore_ascii_case(yes)),
+                    ),
+                    "--noproto:possible_toolchain_types" => Some(false),
+                    _ => None,
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    fn with_possible_toolchain_types(&self, registrations: bool) -> Result<Self> {
+        let mut options = self.clone();
+        if !registrations
+            || self.use_cquery
+            || self.command_options.iter().any(|option| {
+                option.starts_with("--proto:possible_toolchain_types")
+                    || option.starts_with("--noproto:possible_toolchain_types")
+            })
+        {
+            return Ok(options);
+        }
+        if self
+            .optional_toolchain_output(&[
+                "query",
+                "set()",
+                "--output=streamed_proto",
+                "--proto:possible_toolchain_types",
+            ])?
+            .is_some()
+        {
+            options
+                .command_options
+                .push("--proto:possible_toolchain_types".into());
+        }
+        Ok(options)
     }
 
     /// `bazel mod graph --output=json`. The module graph proper survives a module extension
@@ -247,9 +455,23 @@ impl BazelOptions {
         }
 
         hasher.update(b"mode:bzlmod\0");
-        let module_graph = self.module_graph_json().unwrap_or_default();
+        // Bind the guard to the registration data used by generation. Bazel builds can
+        // report the same release and ordinary module graph but emit different query fields.
+        let (graph, registrations) = self.module_graph_output()?;
+        let module_graph = graph
+            .and_then(Self::answered_module_graph)
+            .unwrap_or_default();
         hasher.update(module_graph.as_bytes());
         hasher.update(b"\0");
+        if registrations.is_some() {
+            hasher.update(b"completeModuleToolchainRegistrations\0");
+            if self
+                .with_possible_toolchain_types(true)?
+                .uses_declared_types()
+            {
+                hasher.update(b"directStaticToolchainInputs=5\0");
+            }
+        }
 
         let mapping_start = Instant::now();
         let canonical_names = self.canonical_bzlmod_repo_names()?;
@@ -380,13 +602,15 @@ impl BazelOptions {
             })
     }
 
-    pub fn query_all_targets(&self) -> Result<Vec<Target>> {
+    #[cfg(test)]
+    pub(crate) fn query_all_targets(&self) -> Result<Vec<Target>> {
         self.check_raw_targets_supported()?;
         Ok(self
-            .query_all_targets_with(materialize_repository_inputs_for_batch)?
+            .query_all_targets_with(materialize_repository_inputs_for_batch, None)?
             .targets)
     }
 
+    #[cfg(test)]
     pub(crate) fn check_raw_targets_supported(&self) -> Result<()> {
         if self.isolated_dependency_root.is_some() {
             bail!("--isolatedDependencyRoot requires generate_hashes to retain repository inputs");
@@ -397,6 +621,7 @@ impl BazelOptions {
     pub(crate) fn query_all_targets_with(
         &self,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
+        native_definition: Option<NativeDefinitionRecorder<'_>>,
     ) -> Result<QueriedTargets> {
         if let Some(root) = &self.isolated_dependency_root {
             if self.use_cquery {
@@ -414,7 +639,7 @@ impl BazelOptions {
             .is_ok_and(|found| *found >= BazelVersion(8, 6, 0) && *found != BazelVersion(9, 0, 0));
         let mut survey = ModuleSurvey::default();
         let (bzlmod_enabled, root_mapping) =
-            self.probe_query_repositories(supports_bzlmod, &mut survey);
+            self.probe_query_repositories(supports_bzlmod, &mut survey)?;
         let version = match checked_version {
             Ok(found) => Some(found),
             Err(error) => {
@@ -466,15 +691,36 @@ impl BazelOptions {
         }
         let BzlmodRepos {
             targets: bzlmod_repos,
+            shown_repositories,
             mut failed_extensions,
             canonical_to_apparent,
             module_graph_json,
             root_mapping,
+            toolchain_registrations,
             scope,
         } = bzlmod;
+        let querying = self.with_possible_toolchain_types(toolchain_registrations.is_some())?;
+        let direct_suppliers = toolchain_registrations.is_some() && querying.uses_declared_types();
+        let mapping = root_mapping
+            .as_deref()
+            .map(|raw| crate::hash::parse_apparent_repo_mapping(&String::from_utf8_lossy(raw)))
+            .unwrap_or_default();
+        let fallbacks = repository_fallbacks(&bzlmod_repos, &self.fine_grained_external_repos);
+        let observe_stock_classes = !direct_suppliers
+            && native_definition.is_some()
+            && querying.can_use_observed_inputs()
+            && !fallbacks.is_empty()
+            && root_mapping.is_some()
+            && version.is_some_and(|version| version >= BazelVersion(8, 0, 0));
+        let mut transform = |batch: &mut [Target], inputs| {
+            if !self.use_cquery && !direct_suppliers {
+                batch.iter_mut().for_each(add_legacy_toolchain_inputs);
+            }
+            transform(batch, inputs);
+        };
         let strict = (!scope.members.is_empty()).then(|| Self {
             keep_going: false,
-            ..self.clone()
+            ..querying.clone()
         });
         let mut loads = BTreeMap::new();
         let mut targets = self.collect_all_targets(
@@ -492,12 +738,24 @@ impl BazelOptions {
                         },
                     )
                 } else {
-                    self.query_with(expression, use_cquery, version, &mut |batch| {
-                        transform(batch, None)
-                    })
+                    querying
+                        .query_with_filtered_status(
+                            expression,
+                            use_cquery,
+                            version,
+                            &mut |batch| transform(batch, None),
+                            |_| true,
+                            observe_stock_classes,
+                        )
+                        .map(|(rows, _)| rows)
                 }
             },
         )?;
+        let stock_classes = if observe_stock_classes {
+            take_stock_rule_classes(&mut targets, &mapping)
+        } else {
+            BTreeMap::new()
+        };
         if let Some(strict) = &strict {
             // Direct users may name a target the hub doesn't export. Ask only about
             // edges actually seen in the ordinary graph, and keep the primary's rows.
@@ -545,7 +803,7 @@ impl BazelOptions {
             && !self.fine_grained_external_repos.is_empty()
             && self.isolated_dependency_root.is_none()
         {
-            if let Err(error) = self.acquire_alias_inputs(
+            if let Err(error) = querying.acquire_alias_inputs(
                 &mut targets,
                 root_mapping.as_deref(),
                 version,
@@ -558,15 +816,107 @@ impl BazelOptions {
                 eprintln!("[Warn] keeping ordinary repository fallbacks for incomplete alias discovery: {error:#}");
             }
         }
+        let mut supplier_reads = SupplierReads::default();
+        let mut read_context = RepositoryReadContext {
+            mapping: &mapping,
+            reads: &mut supplier_reads,
+            native_rules: BTreeMap::new(),
+        };
+        match version {
+            Some(version)
+                if !fallbacks.is_empty()
+                    && root_mapping.is_some()
+                    && self.isolated_dependency_root.is_none()
+                    && version >= BazelVersion(8, 0, 0)
+                    && self
+                        .exclude_targets_query
+                        .as_deref()
+                        .is_none_or(|exclude| exclude.trim().is_empty()) =>
+            {
+                match querying.acquire_repository_targets(
+                    &mut targets,
+                    &fallbacks,
+                    (!self.use_cquery && querying.static_toolchain_scope_matches())
+                        .then_some(&shown_repositories),
+                    &mut read_context,
+                    version,
+                    &mut transform,
+                ) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error
+                            .downcast_ref::<QueryFailure>()
+                            .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+                    {
+                        self.check_cancelled()?;
+                        eprintln!("[Warn] keeping repository fallbacks for unresolved ordinary inputs: {error:#}");
+                    }
+                    Err(error) => return Err(error),
+                }
+                if !stock_classes.is_empty() {
+                    querying.add_unreported_query_inputs(
+                        &mut targets,
+                        &mapping,
+                        &stock_classes,
+                        &mut *read_context.reads,
+                        version,
+                    )?;
+                }
+            }
+            _ => {}
+        };
+        let mut static_toolchains = None;
+        if let Some(registrations) = toolchain_registrations
+            .as_ref()
+            .filter(|_| direct_suppliers)
+        {
+            let required = |targets: &[Target]| {
+                targets
+                    .iter()
+                    .filter_map(|target| target.rule.as_option())
+                    .filter_map(|rule| rule.possible_toolchain_types.as_option())
+                    .flat_map(|types| &types.label)
+                    .map(|label| canonical_query_label(label, &mapping).into_owned())
+                    .collect::<BTreeSet<_>>()
+            };
+            let mut known_types = required(&targets);
+            loop {
+                let Some(metadata) =
+                    querying.static_toolchains(&targets, registrations, &mapping, version)?
+                else {
+                    static_toolchains = None;
+                    break;
+                };
+                querying.acquire_static_toolchain_targets(
+                    &mut targets,
+                    &metadata,
+                    &fallbacks,
+                    &mut read_context,
+                    version,
+                    &mut transform,
+                )?;
+                let next_types = required(&targets);
+                static_toolchains = Some(metadata);
+                if next_types == known_types {
+                    break;
+                }
+                known_types = next_types;
+            }
+        }
+        if let Some(record) = native_definition {
+            querying.record_native_definitions(&targets, &mut read_context, record)?;
+        }
         self.check_failed_extension_references(
             &targets,
             &mut failed_extensions,
             &canonical_to_apparent,
         )?;
         Ok(QueriedTargets {
+            direct_toolchain_inputs: direct_suppliers,
             targets,
             module_graph_json,
             root_mapping,
+            static_toolchains,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
                 repositories: scope
@@ -579,8 +929,1274 @@ impl BazelOptions {
                     .collect(),
                 repository_inputs: scope.repository_inputs,
                 queried_files: HashSet::new(),
+                supplier_reads: Some(supplier_reads),
             },
         })
+    }
+
+    fn acquire_repository_targets(
+        &self,
+        targets: &mut Vec<Target>,
+        fallbacks: &HashMap<String, String>,
+        shown_repositories: Option<&BTreeSet<String>>,
+        context: &mut RepositoryReadContext<'_>,
+        version: BazelVersion,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<()> {
+        let mut roots = BTreeSet::new();
+        for row in targets.iter() {
+            let Some(rule) = row.rule.as_option() else {
+                continue;
+            };
+            if !matches!(rule.rule_class.as_str(), "alias" | "filegroup")
+                || main_repo_label_key(&rule.name).starts_with("//external:")
+            {
+                continue;
+            }
+            let mut observed = false;
+            for input in
+                target_inputs(row).filter(|label| repository_fallback(label, fallbacks).is_some())
+            {
+                roots.insert(input.clone());
+                observed = true;
+            }
+            if observed {
+                context.candidate_native(&rule.name);
+            }
+        }
+        match self.acquire_repository_roots(
+            targets,
+            context,
+            version,
+            roots,
+            RepositoryTraversal::Ordinary,
+            transform,
+        ) {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<QueryFailure>()
+                    .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+            {
+                self.check_cancelled()?;
+                eprintln!(
+                    "[Warn] keeping repository fallbacks for unresolved ordinary inputs: {error:#}"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(shown) = shown_repositories.filter(|repos| !repos.is_empty()) {
+            self.acquire_literal_filegroup_readers(
+                targets, fallbacks, shown, context, version, transform,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Follow verified literal native forwarders from a filegroup input when Bazel
+    /// already reported its exact repository. The ordinary collector above remains
+    /// independent of this additional lookup.
+    fn acquire_literal_filegroup_readers(
+        &self,
+        targets: &mut Vec<Target>,
+        fallbacks: &HashMap<String, String>,
+        shown_repositories: &BTreeSet<String>,
+        context: &mut RepositoryReadContext<'_>,
+        version: BazelVersion,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<()> {
+        use crate::proto::blaze_query::attribute::Discriminator;
+        let mapping = context.mapping;
+        let mut referenced = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut missing = BTreeSet::new();
+        for rule in targets.iter().filter_map(|row| row.rule.as_option()) {
+            if rule.rule_class != "filegroup"
+                || main_repo_label_key(&rule.name).starts_with("//external:")
+            {
+                continue;
+            }
+            let mut candidates = BTreeSet::new();
+            for input in &rule.rule_input {
+                if repository_fallback(input, fallbacks).is_some() {
+                    continue;
+                }
+                let label = canonical_query_label(input, mapping);
+                let Some((repo, _)) = label
+                    .strip_prefix("@@")
+                    .and_then(|label| label.split_once("//"))
+                else {
+                    continue;
+                };
+                if repo.is_empty() || !shown_repositories.contains(repo) {
+                    continue;
+                }
+                let label = label.into_owned();
+                missing.insert(label.clone());
+                candidates.insert(label);
+            }
+            if !candidates.is_empty() {
+                referenced
+                    .entry(canonical_query_label(&rule.name, mapping).into_owned())
+                    .or_default()
+                    .extend(candidates);
+            }
+        }
+        for name in targets.iter().filter_map(target_name) {
+            missing.remove(canonical_query_label(name, mapping).as_ref());
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let referrers: BTreeSet<String> = referenced
+            .iter()
+            .filter(|(_, inputs)| inputs.iter().any(|input| missing.contains(input)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &referrers {
+            context.candidate_native(name);
+        }
+        let mut roots = BTreeSet::new();
+        let records = self.structural_rules(&referrers)?;
+        let answered: BTreeSet<_> = records
+            .keys()
+            .map(|name| canonical_query_label(name, mapping).into_owned())
+            .collect();
+        for parent in referrers.difference(&answered) {
+            context.reads.incomplete.insert(parent.clone());
+            if let Some(inputs) = referenced.get(parent) {
+                context
+                    .reads
+                    .deferred_bindings
+                    .entry(parent.clone())
+                    .or_default()
+                    .extend(inputs.iter().cloned());
+            }
+        }
+        for rule in records.into_values() {
+            if rule.rule_class != "filegroup" || rule.rule_class_key.as_deref() != Some("filegroup")
+            {
+                continue;
+            }
+            context.observed_native(&rule.name);
+            let id = canonical_query_label(&rule.name, mapping);
+            let Some(expected) = referenced.get(id.as_ref()) else {
+                continue;
+            };
+            let Some(srcs) = rule.attribute.iter().find(|attribute| {
+                attribute.name == "srcs"
+                    && attribute.r#type == Discriminator::LabelList
+                    && attribute.selector_list.as_option().is_none()
+            }) else {
+                context.defer_binding(&rule, rule.attribute.iter().find(|a| a.name == "srcs"));
+                continue;
+            };
+            let ordinary = rule
+                .rule_input
+                .iter()
+                .map(|input| canonical_query_label(input, mapping).into_owned())
+                .collect::<HashSet<_>>();
+            for label in &srcs.string_list_value {
+                let id = canonical_query_label(label, mapping);
+                if expected.contains(id.as_ref())
+                    && missing.contains(id.as_ref())
+                    && ordinary.contains(id.as_ref())
+                {
+                    roots.insert(id.into_owned());
+                }
+            }
+        }
+        if roots.is_empty() {
+            return Ok(());
+        }
+        self.acquire_repository_roots(
+            targets,
+            context,
+            version,
+            roots,
+            RepositoryTraversal::ReaderLiterals(shown_repositories),
+            transform,
+        )
+    }
+
+    fn acquire_repository_roots(
+        &self,
+        targets: &mut Vec<Target>,
+        context: &mut RepositoryReadContext<'_>,
+        version: BazelVersion,
+        roots: BTreeSet<String>,
+        traversal: RepositoryTraversal<'_>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<()> {
+        use crate::proto::blaze_query::attribute::Discriminator;
+        let mapping = context.mapping;
+        if roots.is_empty() {
+            return Ok(());
+        }
+
+        let primary: HashMap<_, _> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| Some((canonical_query_label(target_name(row)?, mapping), i)))
+            .collect();
+        // A condition can depend on a configurable flag or forwarding alias. A branch
+        // in another, unseen repository stays unresolved rather than triggering a fetch.
+        let represented: HashSet<_> = if traversal == RepositoryTraversal::Conditions {
+            primary
+                .keys()
+                .filter(|label| !main_repo_label_key(label).starts_with("//external:"))
+                .filter_map(|label| label.split_once("//").map(|(repo, _)| repo))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut probe = self.clone();
+        probe.keep_going = true;
+        probe.command_options.extend([
+            "--keep_going".into(),
+            "--proto:rule_classes".into(),
+            "--proto:rule_inputs_and_outputs".into(),
+        ]);
+        let mut visited = HashSet::new();
+        // Keep the initial ordinary roots separate from later forwarding steps.
+        // The original ordinary input set may include configurable alternatives.
+        let initial_roots: HashSet<_> = if traversal == RepositoryTraversal::Ordinary {
+            roots
+                .iter()
+                .map(|label| canonical_query_label(label, mapping).into_owned())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut pending = roots;
+        if traversal == RepositoryTraversal::ProviderLiterals {
+            // A literal registration can name an installed SDK for every platform.
+            // Start only in packages represented by this query's actual targets.
+            let mut absent: HashSet<String> = pending
+                .iter()
+                .filter_map(|label| {
+                    canonical_query_label(label, mapping)
+                        .rsplit_once(':')
+                        .map(|(package, _)| package.to_owned())
+                })
+                .collect();
+            for label in primary.keys() {
+                if let Some((package, _)) = label.rsplit_once(':') {
+                    absent.remove(package);
+                }
+                if absent.is_empty() {
+                    break;
+                }
+            }
+            pending.retain(|label| {
+                canonical_query_label(label, mapping)
+                    .rsplit_once(':')
+                    .is_some_and(|(package, _)| !absent.contains(package))
+            });
+        }
+        let mut bindings = BTreeMap::new();
+        let mut fetched = Vec::new();
+        let mut appended = 0;
+        let mut filegroups = BTreeMap::new();
+        let mut aliases = BTreeSet::new();
+        // A complete ordinary artifact can end in a regular file, or pass through a
+        // native alias or filegroup. Looking below any other rule cannot establish
+        // that proof, and can download archives unrelated to the exported artifact.
+        // An initial ordinary root or a verified literal path can expose a typed reader.
+        // Retain its complete row without following arbitrary rule dependencies.
+        while !pending.is_empty() {
+            let mut missing = BTreeSet::new();
+            for name in std::mem::take(&mut pending) {
+                let id = canonical_query_label(&name, mapping).into_owned();
+                if let RepositoryTraversal::ReaderLiterals(shown) = traversal {
+                    let allowed = main_repo_label_key(&id).starts_with("//")
+                        || id
+                            .strip_prefix("@@")
+                            .and_then(|label| label.split_once("//"))
+                            .is_some_and(|(repo, _)| shown.contains(repo));
+                    if !allowed {
+                        continue;
+                    }
+                }
+                if traversal == RepositoryTraversal::Conditions
+                    && !id
+                        .split_once("//")
+                        .is_some_and(|(repo, _)| represented.contains(repo))
+                {
+                    continue;
+                }
+                if !visited.insert(id.clone()) {
+                    continue;
+                }
+                if let Some(index) = primary.get(id.as_str()) {
+                    let Some(rule) = targets[*index].rule.as_option() else {
+                        continue;
+                    };
+                    match rule.rule_class_key.as_deref() {
+                        _ if traversal.is_reader() => {
+                            if !matches!(rule.rule_class.as_str(), "alias" | "filegroup")
+                                && rule.possible_toolchain_types.as_option().is_some()
+                            {
+                                continue;
+                            }
+                        }
+                        // Read the unflattened actual even if the primary projection
+                        // has only the union of the alias's ordinary dependencies.
+                        _ if traversal == RepositoryTraversal::ProviderLiterals => {
+                            if rule.rule_class != "alias" {
+                                continue;
+                            }
+                        }
+                        Some(class)
+                            if matches!(class, "alias" | "filegroup")
+                                || is_condition_class(class) =>
+                        {
+                            context.observed_native(&rule.name);
+                            if rule.rule_class_key.as_deref() == Some("filegroup") {
+                                filegroups.insert(rule.name.clone(), *index);
+                            }
+                            pending.extend(rule.rule_input.iter().cloned());
+                            continue;
+                        }
+                        None if matches!(rule.rule_class.as_str(), "alias" | "filegroup")
+                            || is_condition_class(&rule.rule_class) => {}
+                        _ => continue,
+                    }
+                }
+                missing.insert(name);
+            }
+            if missing.is_empty() {
+                continue;
+            }
+            // The apparent spelling may differ between a rule input and a returned
+            // row. Bazel owns both spellings; unreturned labels retain their fallback.
+            let expression = self.with_exclude_filter(query_set(&missing)?);
+            let (rows, complete) = match probe.query_with_filtered_status(
+                &expression,
+                false,
+                Some(version),
+                &mut |_| {},
+                |_| true,
+                false,
+            ) {
+                Ok(answer) => answer,
+                Err(error)
+                    if traversal.is_reader()
+                        && error
+                            .downcast_ref::<QueryFailure>()
+                            .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+                {
+                    self.check_cancelled()?;
+                    context.incomplete(&missing);
+                    eprintln!("[Warn] keeping repository fallbacks for unresolved literal forwarders: {error:#}");
+                    continue;
+                }
+                Err(error) => {
+                    context.incomplete(&missing);
+                    return Err(error);
+                }
+            };
+            if !complete {
+                context.incomplete(&missing);
+            }
+            if traversal.is_reader() && !complete {
+                continue;
+            }
+            if traversal.is_literal() {
+                let names = rows
+                    .iter()
+                    .filter_map(|row| row.rule.as_option())
+                    .filter(|rule| rule.rule_class_key.as_deref() == Some("alias"))
+                    .map(|rule| rule.name.clone())
+                    .collect();
+                let observed = match self.alias_actuals(&names, version) {
+                    Ok(observed) => observed,
+                    Err(error)
+                        if traversal.is_reader()
+                            && error
+                                .downcast_ref::<QueryFailure>()
+                                .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+                    {
+                        self.check_cancelled()?;
+                        eprintln!("[Warn] keeping repository fallbacks for unresolved literal aliases: {error:#}");
+                        BTreeMap::new()
+                    }
+                    Err(error) => return Err(error),
+                };
+                context.incomplete(names.iter().filter(|name| !observed.contains_key(*name)));
+                bindings.extend(observed);
+            }
+            let filegroup_records = if traversal.is_reader() {
+                let names = rows
+                    .iter()
+                    .filter_map(|row| row.rule.as_option())
+                    .filter(|rule| rule.rule_class_key.as_deref() == Some("filegroup"))
+                    .map(|rule| rule.name.clone())
+                    .collect();
+                let records = self.structural_rules(&names)?;
+                context.incomplete(names.iter().filter(|name| !records.contains_key(*name)));
+                records
+            } else {
+                HashMap::new()
+            };
+            'row: for row in rows {
+                let Some(name) = target_name(&row) else {
+                    continue;
+                };
+                let id = canonical_query_label(name, mapping);
+                let existing = primary.get(&id).copied();
+                if let Some(rule) = row.rule.as_option().filter(|rule| {
+                    rule.rule_class_key.as_deref().is_some_and(|key| {
+                        key == rule.rule_class
+                            && (matches!(
+                                key,
+                                "alias" | "filegroup" | "toolchain" | "toolchain_type"
+                            ) || is_condition_class(key))
+                    })
+                }) {
+                    context.observed_native(&rule.name);
+                }
+                if let Some(rule) = row.rule.as_option().filter(|rule| {
+                    complete
+                        && rule.possible_toolchain_types.as_option().is_none()
+                        && !rule.rule_class_key.as_deref().is_some_and(|key| {
+                            key == rule.rule_class
+                                && (matches!(
+                                    key,
+                                    "alias"
+                                        | "filegroup"
+                                        | "toolchain"
+                                        | "toolchain_type"
+                                        | "package_group"
+                                ) || is_condition_class(key))
+                        })
+                }) {
+                    context
+                        .reads
+                        .untyped_leaves
+                        .insert(canonical_query_label(&rule.name, mapping).into_owned());
+                }
+                let opaque_reader = complete
+                    && (initial_roots.contains(id.as_ref()) || traversal.is_reader())
+                    && row.rule.as_option().is_some_and(|rule| {
+                        rule.possible_toolchain_types
+                            .as_option()
+                            .is_some_and(|types| !types.label.is_empty())
+                            && !rule.rule_class_key.as_deref().is_some_and(|class| {
+                                matches!(class, "alias" | "filegroup") || is_condition_class(class)
+                            })
+                    });
+                if opaque_reader {
+                    appended += usize::from(existing.is_none());
+                    fetched.push((existing, row));
+                    continue;
+                }
+                if let Some(rule) = row.rule.as_option() {
+                    'binding: {
+                        match rule.rule_class_key.as_deref() {
+                            Some("alias") if traversal.is_literal() => {
+                                let Some(actual) = bindings
+                                    .get(&rule.name)
+                                    .filter(|attr| attr.r#type == Discriminator::Label)
+                                    .and_then(|attr| attr.string_value.as_deref())
+                                else {
+                                    context.defer_binding(rule, bindings.get(&rule.name));
+                                    break 'binding;
+                                };
+                                let dest = canonical_query_label(actual, mapping);
+                                if !rule
+                                    .rule_input
+                                    .iter()
+                                    .any(|input| canonical_query_label(input, mapping) == dest)
+                                {
+                                    context.defer_binding(rule, None);
+                                    break 'binding;
+                                }
+                                pending.insert(actual.to_owned());
+                            }
+                            Some("filegroup") if traversal.is_reader() => {
+                                filegroups.insert(
+                                    rule.name.clone(),
+                                    existing.unwrap_or(targets.len() + appended),
+                                );
+                                let Some(record) = filegroup_records.get(&rule.name) else {
+                                    context.defer_binding(rule, None);
+                                    break 'binding;
+                                };
+                                if record.rule_class != "filegroup"
+                                    || record.rule_class_key.as_deref() != Some("filegroup")
+                                {
+                                    context.defer_binding(rule, None);
+                                    break 'binding;
+                                }
+                                let Some(srcs) = record.attribute.iter().find(|attribute| {
+                                    attribute.name == "srcs"
+                                        && attribute.r#type == Discriminator::LabelList
+                                        && attribute.selector_list.as_option().is_none()
+                                }) else {
+                                    context.defer_binding(
+                                        rule,
+                                        record.attribute.iter().find(|a| a.name == "srcs"),
+                                    );
+                                    break 'binding;
+                                };
+                                let ordinary = rule
+                                    .rule_input
+                                    .iter()
+                                    .map(|input| canonical_query_label(input, mapping).into_owned())
+                                    .collect::<HashSet<_>>();
+                                let fresh = record
+                                    .rule_input
+                                    .iter()
+                                    .map(|input| canonical_query_label(input, mapping).into_owned())
+                                    .collect::<HashSet<_>>();
+                                if srcs.string_list_value.iter().any(|label| {
+                                    let id = canonical_query_label(label, mapping);
+                                    !ordinary.contains(id.as_ref()) || !fresh.contains(id.as_ref())
+                                }) {
+                                    context.defer_binding(rule, None);
+                                    break 'binding;
+                                }
+                                pending.extend(srcs.string_list_value.iter().cloned());
+                                bindings.insert(rule.name.clone(), srcs.clone());
+                            }
+                            _ if traversal.is_literal() => continue 'row,
+                            Some("alias") => {
+                                aliases.insert(rule.name.clone());
+                            }
+                            Some("filegroup") => {
+                                filegroups.insert(
+                                    rule.name.clone(),
+                                    existing.unwrap_or(targets.len() + appended),
+                                );
+                            }
+                            Some(class) if is_condition_class(class) => {}
+                            _ => continue 'row,
+                        }
+                    }
+                    if !traversal.is_literal() {
+                        pending.extend(rule.rule_input.iter().cloned());
+                    }
+                } else if row.source_file.as_option().is_none() || existing.is_some() {
+                    continue;
+                }
+                appended += usize::from(existing.is_none());
+                fetched.push((existing, row));
+            }
+        }
+        let observed = self.alias_actuals(&aliases, version).inspect_err(|_| {
+            context.incomplete(&aliases);
+        })?;
+        context.incomplete(aliases.iter().filter(|name| !observed.contains_key(*name)));
+        bindings.extend(observed);
+        if aliases.iter().any(|name| !bindings.contains_key(name)) {
+            bail!("Bazel did not return every observed forwarding alias binding");
+        }
+        // Acquire only the package definitions of positively reached filegroups.
+        // buildfiles(set(...)) includes their BUILD and loaded .bzl files without
+        // walking their target dependencies.
+        let mut packages = BTreeMap::new();
+        for name in filegroups.keys() {
+            if let Some((package, _)) = name.rsplit_once(':') {
+                packages
+                    .entry(package.to_owned())
+                    .or_insert_with(|| name.clone());
+            }
+        }
+        let mut definitions = HashMap::new();
+        if !packages.is_empty() {
+            let expression =
+                self.with_exclude_filter(format!("buildfiles({})", query_set(packages.values())?));
+            let mut acquired: HashSet<_> = fetched
+                .iter()
+                .filter_map(|(_, row)| target_name(row))
+                .map(|name| canonical_query_label(name, mapping).into_owned())
+                .collect();
+            let (rows, complete) = match probe.query_with_filtered_status(
+                &expression,
+                false,
+                Some(version),
+                &mut |_| {},
+                |_| true,
+                false,
+            ) {
+                Ok(answer) => answer,
+                Err(error)
+                    if traversal.is_reader()
+                        && error
+                            .downcast_ref::<QueryFailure>()
+                            .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+                {
+                    self.check_cancelled()?;
+                    eprintln!("[Warn] keeping repository fallbacks for unresolved literal definitions: {error:#}");
+                    (Vec::new(), false)
+                }
+                Err(error) => {
+                    context.incomplete(filegroups.keys());
+                    return Err(error);
+                }
+            };
+            if !complete {
+                context.incomplete(filegroups.keys());
+            }
+            for row in rows {
+                let Some(source) = row.source_file.as_option() else {
+                    continue;
+                };
+                if let Some((package, "BUILD" | "BUILD.bazel")) = source.name.rsplit_once(':') {
+                    definitions.insert(
+                        package.to_owned(),
+                        std::iter::once(source.name.clone())
+                            .chain(source.subinclude.iter().cloned())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                let id = canonical_query_label(&source.name, mapping);
+                if !primary.contains_key(&id) && acquired.insert(id.into_owned()) {
+                    fetched.push((None, row));
+                }
+            }
+        }
+        drop(primary);
+        for (existing, mut row) in fetched {
+            if let Some(rule) = row.rule.as_option_mut() {
+                if let Some(binding) = bindings.remove(&rule.name) {
+                    rule.attribute
+                        .retain(|attribute| attribute.name != binding.name);
+                    rule.attribute.push(binding);
+                }
+                if let Some(index) = existing {
+                    rule.rule_input
+                        .extend(target_inputs(&targets[index]).cloned());
+                }
+                rule.rule_input.sort_unstable();
+                rule.rule_input.dedup();
+            }
+            transform(std::slice::from_mut(&mut row), None);
+            if let Some(index) = existing {
+                targets[index] = row;
+            } else {
+                targets.push(row);
+            }
+        }
+        for (name, index) in filegroups {
+            if let Some(loads) = name
+                .rsplit_once(':')
+                .and_then(|(package, _)| definitions.get(package))
+            {
+                let inputs = &mut targets[index].rule.as_option_mut().unwrap().rule_input;
+                inputs.extend(loads.iter().cloned());
+                inputs.sort_unstable();
+                inputs.dedup();
+            }
+        }
+        Ok(())
+    }
+
+    /// Acquire caller-projected rows for verified registration paths, their ordinary inputs
+    /// and named implementations in repositories already reached by this query.
+    fn acquire_static_toolchain_targets(
+        &self,
+        targets: &mut Vec<Target>,
+        metadata: &StaticToolchains,
+        fallbacks: &HashMap<String, String>,
+        context: &mut RepositoryReadContext<'_>,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target], Option<RepositoryInputs>),
+    ) -> Result<()> {
+        let mapping = context.mapping;
+        let canonical = |label: &str| canonical_query_label(label, mapping).into_owned();
+        let mut chosen = BTreeSet::new();
+        let mut candidates = BTreeSet::new();
+        let mut bounded = BTreeSet::new();
+        let mut declaration_inputs = metadata.local_setting_inputs.clone();
+        for (ty, literals) in &metadata.by_type {
+            chosen.extend(metadata.type_paths.get(ty).into_iter().flatten().cloned());
+            for name in metadata.type_paths.get(ty).into_iter().flatten() {
+                context.observed_native(name);
+            }
+            for literal in literals {
+                let Some(path) = metadata.registration_path_for(ty, literal) else {
+                    continue;
+                };
+                chosen.extend(path.aliases.iter().cloned());
+                chosen.extend(path.declarations.iter().cloned());
+                for name in path.aliases.iter().chain(&path.declarations) {
+                    context.observed_native(name);
+                }
+                if metadata.unresolved.contains(ty) || metadata.unresolved.contains(literal) {
+                    continue;
+                }
+                for label in &path.declarations {
+                    if metadata.unresolved.contains(label) {
+                        continue;
+                    }
+                    let Some(declaration) = metadata.declarations.get(label) else {
+                        continue;
+                    };
+                    declaration_inputs.extend(
+                        metadata
+                            .nodep_settings
+                            .get(label)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    chosen.extend(
+                        declaration
+                            .ordinary_inputs
+                            .iter()
+                            .chain(metadata.nodep_settings.get(label).into_iter().flatten())
+                            .filter(|input| {
+                                crate::hash::label_package(input)
+                                    == crate::hash::label_package(label)
+                            })
+                            .cloned(),
+                    );
+                    declaration_inputs.extend(
+                        declaration
+                            .ordinary_inputs
+                            .iter()
+                            .filter(|input| {
+                                *input != &declaration.ty
+                                    && !declaration.implementations.contains(*input)
+                            })
+                            .cloned(),
+                    );
+                    for implementation in declaration
+                        .implementations
+                        .iter()
+                        .filter(|label| !label.starts_with("@@["))
+                    {
+                        candidates.insert(implementation.clone());
+                        // Reading the declaration already reached its repository. Its tool
+                        // may live in a different package in that same repository.
+                        if implementation.split_once("//").is_some_and(|(repo, _)| {
+                            label
+                                .split_once("//")
+                                .is_some_and(|(owner, _)| owner == repo)
+                        }) {
+                            bounded.insert(implementation.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // A declaration can use a platform constraint in another package. Its ordinary
+        // edge identifies the target; an observed package in that repository bounds fetching.
+        let mut unrepresented: HashSet<_> = declaration_inputs
+            .iter()
+            .chain(&candidates)
+            .filter_map(|label| label.split_once("//").map(|(repo, _)| repo))
+            .collect();
+        let mut conditions = BTreeSet::new();
+        let mut existing = HashSet::new();
+        for row in targets.iter() {
+            let Some(name) = target_name(row) else {
+                continue;
+            };
+            if main_repo_label_key(name).starts_with("//external:") {
+                continue;
+            }
+            let name = canonical_query_label(name, mapping);
+            if let Some((repo, _)) = name.split_once("//") {
+                unrepresented.remove(repo);
+            }
+            if declaration_inputs.contains(name.as_ref()) {
+                if row
+                    .rule
+                    .as_option()
+                    .is_some_and(|rule| is_condition_class(&rule.rule_class))
+                {
+                    conditions.insert(name.to_string());
+                }
+            } else if !chosen.contains(name.as_ref()) && !candidates.contains(name.as_ref()) {
+                continue;
+            }
+            existing.insert(name.into_owned());
+        }
+        let represented = |label: &str| {
+            label
+                .split_once("//")
+                .is_some_and(|(repo, _)| !unrepresented.contains(repo))
+        };
+        chosen.extend(
+            declaration_inputs
+                .iter()
+                .filter(|label| represented(label))
+                .cloned(),
+        );
+        let implementations: BTreeSet<_> = candidates
+            .iter()
+            .filter(|label| bounded.contains(*label) || represented(label))
+            .cloned()
+            .collect();
+        chosen.extend(implementations.iter().cloned());
+        chosen.retain(|label| !existing.contains(label) || implementations.contains(label));
+        let answer = self.exact_toolchain_rows(&chosen, version)?;
+        if !answer.complete {
+            context.incomplete(&chosen);
+        }
+        let mut roots = BTreeSet::new();
+        for mut row in answer.rows {
+            let Some(name) = target_name(&row).map(canonical) else {
+                continue;
+            };
+            if !chosen.contains(&name) {
+                continue;
+            }
+            if answer.complete
+                && declaration_inputs.contains(&name)
+                && row
+                    .rule
+                    .as_option()
+                    .is_some_and(|rule| is_condition_class(&rule.rule_class))
+            {
+                conditions.insert(name.clone());
+            }
+            if answer.complete && implementations.contains(&name) {
+                roots.extend(
+                    target_inputs(&row)
+                        .filter(|label| repository_fallback(label, fallbacks).is_some())
+                        .cloned(),
+                );
+            }
+            if existing.contains(&name) {
+                continue;
+            }
+            transform(std::slice::from_mut(&mut row), None);
+            targets.push(row);
+        }
+        let Some(version) = version else {
+            return Ok(());
+        };
+        for (roots, traversal, kind) in [
+            (conditions, RepositoryTraversal::Conditions, "condition"),
+            (roots, RepositoryTraversal::ProviderLiterals, "provider"),
+        ] {
+            match self
+                .acquire_repository_roots(targets, context, version, roots, traversal, transform)
+            {
+                Ok(()) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<QueryFailure>()
+                        .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+                {
+                    self.check_cancelled()?;
+                    eprintln!(
+                        "[Warn] Keeping repository fallbacks for unresolved {kind} inputs: {error:#}"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read only the structure of named declarations and type aliases. A declaration
+    /// already in the ordinary graph still needs its NODEP binding when no reader
+    /// requested its type (#619); it is not thereby a MODULE registration.
+    pub(crate) fn static_toolchains(
+        &self,
+        targets: &[Target],
+        registrations: &ModuleToolchainRegistrations,
+        mapping: &HashMap<String, String>,
+        version: Option<BazelVersion>,
+    ) -> Result<Option<StaticToolchains>> {
+        let mut graph = StaticToolchains::default();
+        let canonical = |label: &str| canonical_query_label(label, mapping).into_owned();
+        let rules = || targets.iter().filter_map(|target| target.rule.as_option());
+        let mut typed = rules()
+            .filter_map(|rule| rule.possible_toolchain_types.as_option())
+            .peekable();
+        if self.use_cquery || typed.peek().is_none() {
+            return Ok(None);
+        }
+        let required: BTreeSet<_> = typed
+            .flat_map(|types| types.label.iter().map(|t| canonical(t)))
+            .collect();
+        let mut pending: BTreeSet<_> = rules()
+            .filter(|r| r.rule_class == "toolchain")
+            .map(|r| canonical(&r.name))
+            .collect();
+        graph.registration_order = registrations
+            .labels
+            .iter()
+            .map(|label| canonical(label))
+            .collect();
+        if !required.is_empty() {
+            pending.extend(graph.registration_order.iter().cloned());
+            pending.extend(required.iter().cloned());
+        }
+        let mut structural = self.clone();
+        structural.command_options.extend([
+            "--consistent_labels".into(),
+            "--proto:rule_classes".into(),
+            "--proto:rule_inputs_and_outputs".into(),
+            "--noproto:flatten_selects".into(),
+            "--proto:output_rule_attrs=toolchain_type,toolchain,actual,target_settings".into(),
+        ]);
+        let mut seen = BTreeSet::new();
+        while !pending.is_empty() {
+            let mut current = std::mem::take(&mut pending);
+            current.retain(|label| seen.insert(label.clone()));
+            if current.is_empty() {
+                break;
+            }
+            let answer = structural.exact_toolchain_rows(&current, version)?;
+            if !answer.complete {
+                graph.unresolved.extend(current.iter().cloned());
+            }
+            for target in answer.rows {
+                let Some(rule) = target.rule.as_option() else {
+                    continue;
+                };
+                let name = canonical(&rule.name);
+                if !current.contains(&name) {
+                    continue;
+                }
+                let attr = |name| rule.attribute.iter().find(|a| a.name == name);
+                match rule.rule_class_key.as_deref() {
+                    Some("alias") => {
+                        let Some(actual) = attr("actual") else {
+                            continue;
+                        };
+                        let dest: Vec<_> = structural_labels(actual)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| canonical(s))
+                            .collect();
+                        if dest.is_empty() {
+                            continue;
+                        }
+                        pending.extend(dest.iter().cloned());
+                        graph.aliases.insert(name.clone(), dest);
+                        graph.bindings.insert(
+                            name,
+                            vec![("actual", Sha256::digest(actual.encode_to_vec()).into())],
+                        );
+                    }
+                    Some("toolchain") => {
+                        let Some(ty) = attr("toolchain_type")
+                            .filter(|a| a.nodep != Some(true))
+                            .and_then(|a| a.string_value.as_deref())
+                            .filter(|s| !s.is_empty())
+                        else {
+                            continue;
+                        };
+                        let Some(binding) = attr("toolchain").filter(|a| a.nodep == Some(true))
+                        else {
+                            continue;
+                        };
+                        let ty = canonical(ty);
+                        let implementations: BTreeSet<_> = structural_labels(binding)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| canonical(s))
+                            .collect();
+                        if implementations.is_empty() {
+                            continue;
+                        }
+                        if !required.is_empty() {
+                            pending.insert(ty.clone());
+                        }
+                        let mut bindings = vec![
+                            ("toolchain_type", Sha256::digest(ty.as_bytes()).into()),
+                            ("toolchain", Sha256::digest(binding.encode_to_vec()).into()),
+                        ];
+                        if let Some(settings) = attr("target_settings") {
+                            match declaration_target_settings(settings) {
+                                Some(labels) => {
+                                    if !labels.is_empty() {
+                                        // The declaration owns the binding. On producers using
+                                        // NODEP_LABEL_LIST the resolver reads the matcher content.
+                                        bindings.push((
+                                            "target_settings",
+                                            Sha256::digest(settings.encode_to_vec()).into(),
+                                        ));
+                                        if settings.nodep == Some(true) {
+                                            graph.nodep_settings.insert(
+                                                name.clone(),
+                                                labels.into_iter().map(canonical).collect(),
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    graph.unresolved.insert(name.clone());
+                                }
+                            }
+                        }
+                        graph.bindings.insert(name.clone(), bindings);
+                        graph.declarations.insert(
+                            name,
+                            StaticToolchainDeclaration {
+                                ty,
+                                implementations,
+                                ordinary_inputs: rule
+                                    .rule_input
+                                    .iter()
+                                    .map(|label| canonical(label))
+                                    .collect(),
+                            },
+                        );
+                    }
+                    Some("toolchain_type") => {
+                        graph.native_types.insert(name);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        graph.unresolved.extend(seen.into_iter().filter(|name| {
+            !graph.native_types.contains(name)
+                && !graph.aliases.contains_key(name)
+                && !graph.declarations.contains_key(name)
+        }));
+        if !required.is_empty() {
+            graph.index_types(&required);
+            // The ordinary graph may omit a non-actionable child of a rule that
+            // explicitly names a local declaration. Read only those missing
+            // literals in embedded tools or packages the primary query returned.
+            let registered: HashSet<_> = graph
+                .registration_paths
+                .values()
+                .flat_map(|path| path.declarations.iter())
+                .collect();
+            let local: HashSet<_> = graph
+                .declarations
+                .keys()
+                .filter(|label| !registered.contains(*label))
+                .map(String::as_str)
+                .collect();
+            if !local.is_empty() {
+                // Discover possible forwarding paths on ordinary rows already
+                // returned. Submit only paths named by an actual referrer to
+                // Bazel for native identity and unflattened actual bindings.
+                let mut aliases = HashMap::new();
+                let mut parents: HashMap<_, Vec<_>> = HashMap::new();
+                for rule in rules().filter(|rule| rule.rule_class == "alias") {
+                    let name = canonical(&rule.name);
+                    for input in &rule.rule_input {
+                        parents
+                            .entry(canonical_query_label(input, mapping))
+                            .or_default()
+                            .push(name.clone());
+                    }
+                    aliases.insert(name, rule);
+                }
+                let mut possible = BTreeSet::new();
+                let mut queue: Vec<_> = local.iter().map(|name| (*name).to_owned()).collect();
+                while let Some(label) = queue.pop() {
+                    for alias in parents.get(label.as_str()).into_iter().flatten() {
+                        if possible.insert(alias.clone()) {
+                            queue.push(alias.clone());
+                        }
+                    }
+                }
+                let mut candidates = BTreeSet::new();
+                let mut referenced = Vec::new();
+                for rule in
+                    rules().filter(|rule| rule.possible_toolchain_types.as_option().is_some())
+                {
+                    let mut holder = false;
+                    for input in &rule.rule_input {
+                        let name = canonical_query_label(input, mapping);
+                        if local.contains(name.as_ref()) {
+                            holder = true;
+                            if !graph.unresolved.contains(name.as_ref()) {
+                                graph.local_setting_inputs.extend(
+                                    graph
+                                        .nodep_settings
+                                        .get(name.as_ref())
+                                        .into_iter()
+                                        .flatten()
+                                        .cloned(),
+                                );
+                            }
+                        }
+                        if possible.contains(name.as_ref()) {
+                            holder = true;
+                            referenced.push(name.into_owned());
+                        }
+                    }
+                    if holder {
+                        candidates.extend(rule.rule_input.iter().map(|label| canonical(label)));
+                    }
+                }
+                let mut forwarding = BTreeMap::new();
+                while let Some(name) = referenced.pop() {
+                    if forwarding.contains_key(&name) {
+                        continue;
+                    }
+                    let inputs: Vec<_> = aliases[&name]
+                        .rule_input
+                        .iter()
+                        .map(|input| canonical(input))
+                        .filter(|input| possible.contains(input) || local.contains(input.as_str()))
+                        .collect();
+                    referenced.extend(
+                        inputs
+                            .iter()
+                            .filter(|input| possible.contains(*input))
+                            .cloned(),
+                    );
+                    forwarding.insert(name, inputs);
+                }
+                if !candidates.is_empty() {
+                    let packages: HashSet<_> = candidates
+                        .iter()
+                        .filter_map(|label| {
+                            label
+                                .rsplit_once(':')
+                                .map(|(package, _)| package.to_owned())
+                        })
+                        .collect();
+                    let mut represented = HashSet::new();
+                    for row in targets.iter().filter_map(target_name) {
+                        let label = canonical_query_label(row, mapping);
+                        candidates.remove(label.as_ref());
+                        if let Some((package, _)) = label.rsplit_once(':') {
+                            if packages.contains(package) {
+                                represented.insert(package.to_owned());
+                            }
+                        }
+                    }
+                    candidates.retain(|label| {
+                        label.starts_with("@@bazel_tools//")
+                            || label
+                                .rsplit_once(':')
+                                .is_some_and(|(package, _)| represented.contains(package))
+                    });
+                    forwarding.retain(|name, _| !graph.aliases.contains_key(name));
+                    candidates.extend(forwarding.keys().cloned());
+                    if !candidates.is_empty() {
+                        let answer = structural.exact_toolchain_rows(&candidates, version)?;
+                        if answer.complete {
+                            for target in answer.rows {
+                                let Some(name) = target_name(&target).map(canonical) else {
+                                    continue;
+                                };
+                                if forwarding.contains_key(&name) {
+                                    if let Some(rule) = target.rule.as_option() {
+                                        match rule.rule_class_key.as_deref() {
+                                            Some("alias") => {
+                                                let destinations: Vec<_> = rule
+                                                    .attribute
+                                                    .iter()
+                                                    .find(|attr| attr.name == "actual")
+                                                    .into_iter()
+                                                    .flat_map(structural_labels)
+                                                    .filter(|label| !label.is_empty())
+                                                    .map(|label| canonical(label))
+                                                    .collect();
+                                                if !destinations.is_empty() {
+                                                    forwarding.remove(&name);
+                                                    graph
+                                                        .local_registration_aliases
+                                                        .insert(name, destinations);
+                                                }
+                                            }
+                                            Some(_) => {
+                                                forwarding.remove(&name);
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let native_group = target.rule.as_option().is_some_and(|rule| {
+                                    rule.rule_class_key.as_deref() == Some("package_group")
+                                });
+                                if native_group
+                                    || target.r#type == target::Discriminator::SourceFile
+                                {
+                                    if let Some(label) = target_name(&target) {
+                                        graph.non_reader_inputs.insert(canonical(label));
+                                    }
+                                }
+                            }
+                        }
+                        // A missing answer cannot prove a local binding.
+                        // Retain the known declaration's old uncertainty on the
+                        // referrer instead of discarding an ordinary path.
+                        graph.unresolved.extend(forwarding.keys().cloned());
+                        // A referenced registration can end at a local declaration through
+                        // several aliases. The verified last hop carries its matcher labels.
+                        for (alias, values) in &graph.local_registration_aliases {
+                            if graph.unresolved.contains(alias) {
+                                continue;
+                            }
+                            for value in values {
+                                if local.contains(value.as_str())
+                                    && !graph.unresolved.contains(value)
+                                {
+                                    graph.local_setting_inputs.extend(
+                                        graph
+                                            .nodep_settings
+                                            .get(value)
+                                            .into_iter()
+                                            .flatten()
+                                            .cloned(),
+                                    );
+                                }
+                            }
+                        }
+                        graph.local_registration_aliases.extend(forwarding);
+                    }
+                }
+            }
+        }
+        Ok(Some(graph))
+    }
+
+    /// An exact row read, in the caller's attribute projection unless the structural
+    /// discovery above selected its own. Callers choose the bounded literal set to
+    /// acquire, and may only rely on labels actually returned. No deps() traversal.
+    pub(crate) fn exact_toolchain_rows(
+        &self,
+        labels: &BTreeSet<String>,
+        version: Option<BazelVersion>,
+    ) -> Result<LiteralToolchainRows> {
+        let operands: BTreeSet<_> = labels
+            .iter()
+            .filter(|label| !label.starts_with("@@["))
+            .cloned()
+            .collect();
+        if operands.is_empty() {
+            return Ok(LiteralToolchainRows {
+                rows: Vec::new(),
+                complete: labels.is_empty(),
+            });
+        }
+        let mut query = self.clone();
+        query.keep_going = true;
+        query.command_options.push("--keep_going".into());
+        let expression = self.with_exclude_filter(query_set(&operands)?);
+        match query.query_with_filtered_status(
+            &expression,
+            false,
+            version,
+            &mut |_| {},
+            |_| true,
+            false,
+        ) {
+            Ok((rows, complete)) => Ok(LiteralToolchainRows {
+                rows,
+                complete: complete && labels.len() == operands.len(),
+            }),
+            Err(error)
+                if error
+                    .downcast_ref::<QueryFailure>()
+                    .is_some_and(|e| matches!(e.code, Some(3 | 7))) =>
+            {
+                self.check_cancelled()?;
+                eprintln!("[Warn] Keeping unresolved toolchain inputs for an unavailable literal query: {error:#}");
+                Ok(LiteralToolchainRows {
+                    rows: Vec::new(),
+                    complete: false,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// A fine repository may expose libraries in other repositories through aliases. Follow
@@ -720,9 +2336,8 @@ impl BazelOptions {
         // Primary and supplemental rows may have been prehashed, which releases their
         // projected attributes. Re-read only these native aliases with the original options,
         // then use their evaluated actual, including the mapping of select keys to labels.
-        let names = bindings.keys().cloned().collect();
         let mut aliases_with_attrs = strict.query_with(
-            &self.with_exclude_filter(query_set(&names)?),
+            &self.with_exclude_filter(query_set(bindings.keys())?),
             false,
             Some(version),
             &mut |_| {},
@@ -784,6 +2399,126 @@ impl BazelOptions {
             }
         }
         Ok(())
+    }
+
+    /// Supply the full native definitions used by acquisition to direct hashing.
+    /// Only already-returned rules are requested. An unavailable definition stays
+    /// an uncertainty on that rule and its observed inputs.
+    fn record_native_definitions(
+        &self,
+        targets: &[Target],
+        context: &mut RepositoryReadContext<'_>,
+        record: NativeDefinitionRecorder<'_>,
+    ) -> Result<()> {
+        let mapping = context.mapping;
+        let mut requested = BTreeMap::<String, bool>::new();
+        for (name, observed) in &context.native_rules {
+            requested
+                .entry(canonical_query_label(name, mapping).into_owned())
+                .and_modify(|known| *known |= *observed)
+                .or_insert(*observed);
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let mut indexed = BTreeMap::<String, Vec<&Rule>>::new();
+        for rule in targets.iter().filter_map(|target| target.rule.as_option()) {
+            let id = canonical_query_label(&rule.name, mapping).into_owned();
+            if requested.contains_key(&id) {
+                indexed.entry(id).or_default().push(rule);
+            }
+        }
+        context.incomplete(requested.keys().filter(|id| !indexed.contains_key(*id)));
+        let labels = indexed.keys().cloned().collect();
+        let mut returned = BTreeMap::new();
+        let mut duplicates = BTreeSet::new();
+        for rule in self.structural_rules(&labels)?.into_values() {
+            let id = canonical_query_label(&rule.name, mapping).into_owned();
+            if returned.insert(id.clone(), rule).is_some() {
+                duplicates.insert(id);
+            }
+        }
+        for (id, expected) in indexed {
+            let actual = returned.get(&id).filter(|_| !duplicates.contains(&id));
+            let native = actual.is_some_and(|rule| {
+                rule.rule_class_key.as_deref().is_some_and(|key| {
+                    key == rule.rule_class
+                        && (matches!(key, "alias" | "filegroup" | "toolchain" | "toolchain_type")
+                            || is_condition_class(key))
+                })
+            });
+            if !requested[&id]
+                && actual.is_some_and(|rule| rule.rule_class_key.is_some())
+                && !native
+            {
+                continue;
+            }
+            for expected in expected {
+                let inputs = expected
+                    .rule_input
+                    .iter()
+                    .map(|input| canonical_query_label(input, mapping))
+                    .collect::<HashSet<_>>();
+                if let Some(actual) = actual.filter(|actual| {
+                    native
+                        && actual.rule_class == expected.rule_class
+                        && actual
+                            .rule_input
+                            .iter()
+                            .all(|input| inputs.contains(&canonical_query_label(input, mapping)))
+                }) {
+                    let mut definition = actual.clone();
+                    definition.name = expected.name.clone();
+                    record(&expected.name, &definition);
+                    context.reads.verified_native.insert(id.clone());
+                } else {
+                    context.reads.incomplete.insert(id.clone());
+                    context.reads.unrecorded_definitions.insert(id.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify native forwarding roles and unflattened bindings on labels already in the
+    /// caller's graph. This query does not add any targets to a raw hash request.
+    fn structural_rules(&self, labels: &BTreeSet<String>) -> Result<HashMap<String, Rule>> {
+        if labels.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut metadata = self.clone();
+        metadata.keep_going = false;
+        metadata.command_options.extend([
+            "--nokeep_going".into(),
+            "--proto:rule_classes".into(),
+            "--proto:default_values".into(),
+            "--proto:rule_inputs_and_outputs".into(),
+            "--noproto:flatten_selects".into(),
+            "--proto:output_rule_attrs=all".into(),
+        ]);
+        let rows = match metadata.query_with(
+            &self.with_exclude_filter(query_set(labels)?),
+            false,
+            None,
+            &mut |_| {},
+        ) {
+            Ok(rows) => rows,
+            Err(error)
+                if error
+                    .downcast_ref::<QueryFailure>()
+                    .is_some_and(|failure| matches!(failure.code, Some(3 | 7))) =>
+            {
+                self.check_cancelled()?;
+                eprintln!("[Warn] retaining repository fallbacks for unresolved structural rules: {error:#}");
+                return Ok(HashMap::new());
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.rule.into_option())
+            .map(|rule| (rule.name.clone(), rule))
+            .collect())
     }
 
     fn alias_actuals(
@@ -902,8 +2637,12 @@ impl BazelOptions {
             }
         };
         let canonical_to_apparent = parse_repo_mapping(&String::from_utf8_lossy(&root_mapping));
+        let (graph_output, toolchain_registrations) = match survey.graph {
+            Some(output) => (Some(output), survey.toolchain_registrations),
+            None => self.module_graph_output()?,
+        };
         let (module_graph, complete_graph) =
-            match self.module_graph_json_tolerating(survey.graph, &mut failed) {
+            match self.module_graph_json_tolerating(graph_output, &mut failed) {
                 Ok((json, complete)) => (Some(json), complete),
                 Err(error) if self.keep_going && self.isolated_dependency_root.is_none() => {
                     eprintln!("[Warn] {error:#}; hashing Bzlmod repositories without module edges");
@@ -1006,6 +2745,10 @@ impl BazelOptions {
                 BTreeSet::new()
             },
         };
+        let shown_repositories = repositories
+            .iter()
+            .filter_map(|repository| repository.canonical_name.clone())
+            .collect();
         let targets = lower_repositories(
             repositories,
             &canonical_to_apparent,
@@ -1022,9 +2765,15 @@ impl BazelOptions {
         );
         Ok(BzlmodRepos {
             targets,
+            shown_repositories,
             failed_extensions: failed,
             canonical_to_apparent,
             module_graph_json: module_graph,
+            toolchain_registrations: if complete_graph {
+                toolchain_registrations
+            } else {
+                None
+            },
             root_mapping: retain_root_mapping.then_some(root_mapping),
             scope,
         })
@@ -1706,7 +3455,29 @@ impl BazelOptions {
     }
 
     pub fn query(&self, expression: &str, use_cquery: bool) -> Result<Vec<Target>> {
-        self.query_with(expression, use_cquery, None, &mut |_| {})
+        let mut targets = self.query_with(expression, use_cquery, None, &mut |_| {})?;
+        if !use_cquery {
+            // A standalone query returns exactly its requested records. Use the
+            // same metadata boundary as hash_targets when its caller requested
+            // typed output, including through an effective bazelrc setting.
+            let typed = self.static_toolchain_scope_matches()
+                && (self.uses_declared_types()
+                    || targets.iter().any(|target| {
+                        target
+                            .rule
+                            .as_option()
+                            .is_some_and(|rule| rule.possible_toolchain_types.as_option().is_some())
+                    }));
+            let direct = typed
+                && self.module_graph_output()?.1.is_some()
+                && self
+                    .with_possible_toolchain_types(true)?
+                    .uses_declared_types();
+            if !direct {
+                targets.iter_mut().for_each(add_legacy_toolchain_inputs);
+            }
+        }
+        Ok(targets)
     }
 
     fn query_with(
@@ -1719,55 +3490,412 @@ impl BazelOptions {
         self.query_with_filtered(expression, use_cquery, version, transform, |_| true)
     }
 
+    /// With nodep edges disabled, a walk limited to one step adds RuleClass
+    /// toolchain defaults to ordinary attribute inputs. A complete proto witness with conservative
+    /// aspects includes the other walked inputs, so their difference belongs to
+    /// the class. A peer separates a default masked by an ordinary occurrence.
+    fn add_unreported_query_inputs(
+        &self,
+        targets: &mut [Target],
+        mapping: &HashMap<String, String>,
+        classes: &BTreeMap<String, StockRuleClass>,
+        reads: &mut SupplierReads,
+        version: BazelVersion,
+    ) -> Result<()> {
+        let groups = classes.values().collect::<Vec<_>>();
+        let mut samples = BTreeMap::<String, Vec<usize>>::new();
+        for StockRuleClass {
+            representative,
+            members,
+        } in &groups
+        {
+            let name = target_name(&targets[*representative]).expect("indexed rule");
+            let owner = canonical_query_label(name, mapping);
+            samples
+                .entry(owner.as_ref().to_owned())
+                .or_default()
+                .extend(members.iter().copied().filter(|&index| {
+                    target_name(&targets[index])
+                        .is_some_and(|name| canonical_query_label(name, mapping) == owner)
+                }));
+        }
+        let first = self.walked_query_inputs(samples.keys(), mapping, version)?;
+        let first_flat = self.flat_query_inputs(samples.keys(), mapping, version)?;
+        let mut local = BTreeMap::<usize, BTreeSet<String>>::new();
+        queue_stock_inputs(&first, &samples, targets, mapping, &mut local);
+        let mut additions = BTreeMap::<usize, BTreeSet<String>>::new();
+        let mut uncertain = BTreeMap::<usize, BTreeSet<String>>::new();
+        let mut peers = BTreeMap::<String, Vec<usize>>::new();
+        let mut peer_groups = BTreeMap::<String, BTreeSet<usize>>::new();
+        let mut overlaps = Vec::<(usize, String, String)>::new();
+        for (
+            group,
+            StockRuleClass {
+                representative,
+                members,
+            },
+        ) in groups.iter().enumerate()
+        {
+            let rule = targets[*representative]
+                .rule
+                .as_option()
+                .expect("indexed rule");
+            let owner = canonical_query_label(&rule.name, mapping);
+            let Some(inputs) = first.inputs.get(owner.as_ref()) else {
+                continue;
+            };
+            let Some(ordinary) = first_flat.inputs(owner.as_ref()) else {
+                for input in inputs {
+                    queue_stock_uncertainty(&mut uncertain, group, input);
+                }
+                continue;
+            };
+            additions.entry(group).or_default().extend(
+                inputs
+                    .iter()
+                    .filter(|input| !ordinary.contains(*input))
+                    .cloned(),
+            );
+            let mut masked = inputs
+                .iter()
+                .filter(|input| ordinary.contains(*input))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut unquotable = BTreeSet::new();
+            let mut ordered = members.to_vec();
+            ordered.sort_unstable_by(|left, right| {
+                target_name(&targets[*left])
+                    .expect("indexed rule")
+                    .cmp(target_name(&targets[*right]).expect("indexed rule"))
+                    .then_with(|| left.cmp(right))
+            });
+            for index in ordered {
+                if masked.is_empty() {
+                    break;
+                }
+                let rule = targets[index].rule.as_option().expect("indexed rule");
+                let name = canonical_query_label(&rule.name, mapping);
+                if name == owner {
+                    continue;
+                }
+                let present = rule
+                    .rule_input
+                    .iter()
+                    .map(|input| canonical_query_label(input, mapping))
+                    .filter(|input| masked.contains(input.as_ref()))
+                    .map(Cow::into_owned)
+                    .collect::<HashSet<_>>();
+                if present.len() == masked.len() {
+                    continue;
+                }
+                let missing = masked
+                    .iter()
+                    .filter(|input| !present.contains(*input))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if name.contains('"') {
+                    unquotable.extend(missing);
+                    continue;
+                }
+                let name = name.into_owned();
+                peers.entry(name.clone()).or_default().push(index);
+                peer_groups.entry(name.clone()).or_default().insert(group);
+                for input in missing {
+                    masked.remove(&input);
+                    overlaps.push((group, input, name.clone()));
+                }
+            }
+            for input in masked.intersection(&unquotable) {
+                queue_stock_uncertainty(&mut uncertain, group, input);
+            }
+        }
+        let second = self.walked_query_inputs(peers.keys(), mapping, version)?;
+        let second_flat = self.flat_query_inputs(peers.keys(), mapping, version)?;
+        queue_stock_inputs(&second, &peers, targets, mapping, &mut local);
+        for (owner, inputs) in &second.inputs {
+            let Some(samples) = peer_groups.get(owner) else {
+                continue;
+            };
+            for &group in samples {
+                if let Some(ordinary) = second_flat.inputs(owner) {
+                    additions.entry(group).or_default().extend(
+                        inputs
+                            .iter()
+                            .filter(|input| !ordinary.contains(*input))
+                            .cloned(),
+                    );
+                } else {
+                    for input in inputs {
+                        queue_stock_uncertainty(&mut uncertain, group, input);
+                    }
+                }
+            }
+        }
+        for (group, input, peer) in overlaps {
+            let answered = second_flat
+                .inputs(&peer)
+                .filter(|ordinary| !ordinary.contains(&input))
+                .and_then(|_| second.has_input(&peer, &input));
+            if answered.is_none() {
+                queue_stock_uncertainty(&mut uncertain, group, &input);
+            }
+        }
+        let mut observed = HashMap::<String, usize>::new();
+        let wanted = local
+            .values()
+            .chain(additions.values())
+            .flatten()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        for (index, target) in targets.iter().enumerate() {
+            let Some(name) = target_name(target).filter(|name| !name.starts_with("//external:"))
+            else {
+                continue;
+            };
+            let canonical = canonical_query_label(name, mapping);
+            if !wanted.contains(canonical.as_ref()) {
+                continue;
+            }
+            observed
+                .entry(canonical.into_owned())
+                .and_modify(|previous| {
+                    if name < target_name(&targets[*previous]).expect("indexed target") {
+                        *previous = index;
+                    }
+                })
+                .or_insert(index);
+        }
+        for (index, inputs) in local {
+            add_stock_inputs(targets, &[index], &inputs, mapping, &observed);
+        }
+        for (group, inputs) in additions {
+            add_stock_inputs(targets, &groups[group].members, &inputs, mapping, &observed);
+        }
+        for (group, repositories) in uncertain {
+            for &index in &groups[group].members {
+                let name = target_name(&targets[index]).expect("indexed rule");
+                reads
+                    .uncertain_class_repositories
+                    .entry(name.to_owned())
+                    .or_default()
+                    .extend(repositories.iter().cloned());
+            }
+        }
+        Ok(())
+    }
+
+    /// A loading walk limited to one step. Partial output supplies positive edges only.
+    fn walked_query_inputs<'a>(
+        &self,
+        roots: impl IntoIterator<Item = &'a String>,
+        mapping: &HashMap<String, String>,
+        version: BazelVersion,
+    ) -> Result<StockWalk> {
+        let roots = roots.into_iter().cloned().collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            return Ok(StockWalk::default());
+        }
+        let expression = format!("deps({}, 1)", query_set(&roots)?);
+        let (output_file, output) = self
+            .query_output(&expression, version, QueryFormat::Walked)
+            .context("failed to read walked query inputs")?;
+        self.check_cancelled()?;
+        if !matches!(output.status.code(), Some(0 | 3 | 7)) {
+            return Err(QueryFailure {
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+            .into());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut answer = StockWalk {
+            inputs: BTreeMap::new(),
+            returned: BTreeSet::new(),
+            unrecognized: BTreeSet::new(),
+            complete: output.status.success() && !stderr.contains("ERROR:"),
+        };
+        if !answer.complete {
+            eprintln!("[Warn] Walked query inputs are incomplete; retaining only returned edges");
+        }
+        if self.verbose && !stderr.is_empty() {
+            eprint!("{stderr}");
+        }
+        for line in BufReader::new(File::open(output_file.path())?).lines() {
+            let line = line?;
+            let Some(body) = line
+                .strip_prefix("  \"")
+                .and_then(|body| body.strip_suffix('"'))
+            else {
+                continue;
+            };
+            if let Some((owner, input)) = body.split_once("\" -> \"") {
+                if owner.contains('"') {
+                    continue;
+                }
+                let owner = canonical_query_label(owner, mapping).into_owned();
+                if !roots.contains(&owner) {
+                    continue;
+                }
+                answer.returned.insert(owner.clone());
+                // Bazel writes raw labels in DOT; an embedded quote is ambiguous.
+                if input.contains('"') {
+                    answer.unrecognized.insert(owner);
+                    continue;
+                }
+                answer
+                    .inputs
+                    .entry(owner)
+                    .or_default()
+                    .insert(canonical_query_label(input, mapping).into_owned());
+            } else if !body.contains('"') {
+                let name = canonical_query_label(body, mapping).into_owned();
+                if roots.contains(&name) {
+                    answer.returned.insert(name);
+                }
+            }
+        }
+        Ok(answer)
+    }
+
+    /// A complete flat witness contains ordinary and conservative aspect inputs.
+    /// Its projection is private to comparison and does not replace the primary row.
+    fn flat_query_inputs<'a>(
+        &self,
+        roots: impl IntoIterator<Item = &'a String>,
+        mapping: &HashMap<String, String>,
+        version: BazelVersion,
+    ) -> Result<StockFlat> {
+        let roots = roots.into_iter().cloned().collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            return Ok(StockFlat::default());
+        }
+        let mut probe = self.clone();
+        probe.keep_going = false;
+        probe.command_options.extend([
+            "--nonodep_deps".into(),
+            "--aspect_deps=conservative".into(),
+            "--proto:rule_inputs_and_outputs".into(),
+            "--proto:output_rule_attrs=tags".into(),
+            "--consistent_labels".into(),
+            "--nofetch".into(),
+            "--nokeep_going".into(),
+        ]);
+        let (rows, complete) = match probe.query_with_filtered_status(
+            &query_set(&roots)?,
+            false,
+            Some(version),
+            &mut |_| {},
+            |_| true,
+            false,
+        ) {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.check_cancelled()?;
+                if error
+                    .downcast_ref::<QueryFailure>()
+                    .is_some_and(|failure| matches!(failure.code, Some(3 | 7)))
+                {
+                    return Ok(StockFlat::default());
+                }
+                return Err(error);
+            }
+        };
+        let mut inputs = BTreeMap::new();
+        let mut duplicates = BTreeSet::new();
+        for row in rows {
+            let Some(rule) = row.rule.into_option() else {
+                continue;
+            };
+            let name = canonical_query_label(&rule.name, mapping).into_owned();
+            if !roots.contains(&name) {
+                continue;
+            }
+            let ordinary = rule
+                .rule_input
+                .iter()
+                .map(|input| canonical_query_label(input, mapping).into_owned())
+                .collect();
+            if inputs.insert(name.clone(), ordinary).is_some() {
+                duplicates.insert(name);
+            }
+        }
+        inputs.retain(|name, _| !duplicates.contains(name));
+        Ok(StockFlat { inputs, complete })
+    }
+
     fn query_with_filtered(
         &self,
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
         transform: &mut impl FnMut(&mut [Target]),
-        retain: impl Fn(&Target) -> bool,
+        retain: impl FnMut(&Target) -> bool,
     ) -> Result<Vec<Target>> {
-        let version = match version {
-            Some(version) => version,
-            None => self.version()?,
-        };
-        let compatible = if use_cquery {
-            Some(self.query_compatible_labels(expression)?)
-        } else {
-            None
-        };
+        self.query_with_filtered_status(expression, use_cquery, version, transform, retain, false)
+            .map(|(rows, _)| rows)
+    }
+
+    /// Run one query format with shared output files and cancellation handling.
+    fn query_output(
+        &self,
+        expression: &str,
+        version: BazelVersion,
+        format: QueryFormat,
+    ) -> Result<(NamedTempFile, Output)> {
         let query_file = NamedTempFile::new().context("create query file")?;
         fs::write(query_file.path(), expression).context("write query file")?;
         let output_file = NamedTempFile::new().context("create query output file")?;
-        let streamed_cquery = version >= BazelVersion(7, 0, 0);
-        let supports_output_file = version >= BazelVersion(8, 2, 0);
-
         let mut command = self.command();
-        command.arg(if use_cquery { "cquery" } else { "query" });
-        if use_cquery {
-            command.arg("--transitions=lite");
-        }
-        command
-            .arg("--output")
-            .arg(if use_cquery && !streamed_cquery {
-                "proto"
-            } else {
-                "streamed_proto"
-            })
-            .arg("--proto:instantiation_stack");
-        if !use_cquery {
-            command.arg("--order_output=no");
-        }
-        if self.keep_going {
-            command.arg("--keep_going");
-        }
-        if use_cquery {
-            command
-                .args(&self.cquery_options)
-                .arg("--consistent_labels");
-        } else {
-            command.args(&self.command_options);
-        }
+        let supports_output_file = match format {
+            QueryFormat::Ordinary { keep_class_keys } => {
+                command
+                    .arg("query")
+                    .arg("--output")
+                    .arg("streamed_proto")
+                    .arg("--proto:instantiation_stack")
+                    .arg("--order_output=no");
+                if keep_class_keys {
+                    // Explicit caller options follow and can turn this projection off.
+                    command.arg("--proto:rule_classes");
+                }
+                if self.keep_going {
+                    command.arg("--keep_going");
+                }
+                command.args(&self.command_options);
+                version >= BazelVersion(8, 2, 0)
+            }
+            QueryFormat::Configured => {
+                command
+                    .arg("cquery")
+                    .arg("--transitions=lite")
+                    .arg("--output")
+                    .arg(if version >= BazelVersion(7, 0, 0) {
+                        "streamed_proto"
+                    } else {
+                        "proto"
+                    })
+                    .arg("--proto:instantiation_stack");
+                if self.keep_going {
+                    command.arg("--keep_going");
+                }
+                command
+                    .args(&self.cquery_options)
+                    .arg("--consistent_labels");
+                version >= BazelVersion(8, 2, 0)
+            }
+            QueryFormat::Walked => {
+                command.arg("query").args(&self.command_options).args([
+                    "--output=graph",
+                    "--nograph:factored",
+                    "--graph:conditional_edges_limit=0",
+                    "--consistent_labels",
+                    "--nonodep_deps",
+                    "--nofetch",
+                    "--keep_going",
+                ]);
+                false
+            }
+        };
         command.arg("--query_file").arg(query_file.path());
         if supports_output_file {
             command.arg("--output_file").arg(output_file.path());
@@ -1783,10 +3911,42 @@ impl BazelOptions {
         let output = self
             .run_configured(&mut command)
             .context("failed to execute Bazel query")?;
+        Ok((output_file, output))
+    }
+
+    fn query_with_filtered_status(
+        &self,
+        expression: &str,
+        use_cquery: bool,
+        version: Option<BazelVersion>,
+        transform: &mut impl FnMut(&mut [Target]),
+        retain: impl FnMut(&Target) -> bool,
+        keep_class_keys: bool,
+    ) -> Result<(Vec<Target>, bool)> {
+        let version = match version {
+            Some(version) => version,
+            None => self.version()?,
+        };
+        let compatible = if use_cquery {
+            Some(self.query_compatible_labels(expression)?)
+        } else {
+            None
+        };
+        let streamed_cquery = version >= BazelVersion(7, 0, 0);
+        let format = if use_cquery {
+            QueryFormat::Configured
+        } else {
+            QueryFormat::Ordinary { keep_class_keys }
+        };
+        let (output_file, output) = self.query_output(expression, version, format)?;
         let code = output.status.code().unwrap_or(-1);
         if code != 0 && !(self.keep_going && code == 3) {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Bazel query failed, exit code {code}: {stderr}");
+            return Err(QueryFailure {
+                code: output.status.code(),
+                stderr: stderr.into_owned(),
+            }
+            .into());
         }
         if !output.stderr.is_empty() {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
@@ -1795,7 +3955,7 @@ impl BazelOptions {
         let mut targets = if use_cquery {
             decode_cquery_stream(output_file.path(), streamed_cquery, transform)?
         } else {
-            decode_target_stream_filtered(output_file.path(), transform, retain)?
+            decode_target_stream_filtered(output_file.path(), transform, retain, keep_class_keys)?
         };
         if let Some(compatible) = compatible {
             targets.retain(|target| {
@@ -1804,7 +3964,8 @@ impl BazelOptions {
                 })
             });
         }
-        Ok(targets)
+        let complete = code == 0 && !String::from_utf8_lossy(&output.stderr).contains("ERROR:");
+        Ok((targets, complete))
     }
 
     fn query_compatible_labels(&self, expression: &str) -> Result<HashSet<String>> {
@@ -1980,6 +4141,7 @@ fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
 #[derive(Default)]
 struct ModuleSurvey {
     graph: Option<Output>,
+    toolchain_registrations: Option<ModuleToolchainRegistrations>,
     mappings: BTreeMap<String, RepoMapping>,
 }
 
@@ -2021,7 +4183,18 @@ fn query_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Result<String> 
         .map(|labels| labels.join(" + "))
 }
 
-fn canonical_query_label<'a>(label: &'a str, mapping: &HashMap<String, String>) -> Cow<'a, str> {
+/// Native rules that Bazel itself evaluates when matching a select condition.
+pub(crate) fn is_condition_class(class: &str) -> bool {
+    matches!(
+        class,
+        "config_setting" | "constraint_value" | "constraint_setting"
+    )
+}
+
+pub(crate) fn canonical_query_label<'a>(
+    label: &'a str,
+    mapping: &HashMap<String, String>,
+) -> Cow<'a, str> {
     let label = main_repo_label_key(label);
     if let Some((repo, target)) = label.strip_prefix('@').and_then(|s| s.split_once("//")) {
         if let Some(canonical) = mapping.get(repo) {
@@ -2045,9 +4218,9 @@ fn target_inputs(target: &Target) -> impl Iterator<Item = &String> {
         )
 }
 
-fn query_set(labels: &BTreeSet<String>) -> Result<String> {
+fn query_set<'a>(labels: impl IntoIterator<Item = &'a String>) -> Result<String> {
     let operands = labels
-        .iter()
+        .into_iter()
         .map(|label| query_labels(std::iter::once(label)))
         .collect::<Result<Vec<_>>>()?;
     Ok(format!("set({})", operands.join(" ")))
@@ -2553,18 +4726,495 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
     }
 }
 
+pub(crate) type NativeDefinitionRecorder<'a> = &'a mut dyn FnMut(&str, &Rule);
+
 #[derive(Clone, Default)]
 pub(crate) struct ScopedSources {
     pub(crate) repositories: BTreeSet<String>,
     pub(crate) repository_inputs: BTreeSet<String>,
     pub(crate) queried_files: HashSet<String>,
+    /// None for caller-supplied query rows with no record of optional lookups.
+    pub(crate) supplier_reads: Option<SupplierReads>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SupplierReads {
+    /// Exact roots of incomplete dependency or definition reads.
+    pub(crate) incomplete: BTreeSet<String>,
+    /// Reached rule whose own toolchain requirements were not reported.
+    pub(crate) untyped_leaves: BTreeSet<String>,
+    /// Ordinary alternatives of a native forwarder whose binding the walk left opaque.
+    pub(crate) deferred_bindings: BTreeMap<String, BTreeSet<String>>,
+    /// Canonical repository names reached by unresolved class inputs, keyed by
+    /// the exact returned member name. These are transitive uncertainty only.
+    pub(crate) uncertain_class_repositories: BTreeMap<String, BTreeSet<String>>,
+    /// Native definitions used by acquisition but unavailable to direct hashing.
+    pub(crate) unrecorded_definitions: BTreeSet<String>,
+    /// Native identities whose full definitions contributed to direct hashing.
+    pub(crate) verified_native: BTreeSet<String>,
+}
+
+/// Repository mapping and observations shared by supplemental queries in one generation.
+struct RepositoryReadContext<'a> {
+    mapping: &'a HashMap<String, String>,
+    reads: &'a mut SupplierReads,
+    /// Candidate names mapped to whether acquisition already observed a native identity.
+    native_rules: BTreeMap<String, bool>,
+}
+
+impl RepositoryReadContext<'_> {
+    fn candidate_native(&mut self, name: &str) {
+        self.native_rules.entry(name.to_owned()).or_insert(false);
+    }
+
+    fn observed_native(&mut self, name: &str) {
+        self.native_rules.insert(name.to_owned(), true);
+    }
+
+    fn defer_binding(&mut self, rule: &Rule, attribute: Option<&Attribute>) {
+        let mapping = self.mapping;
+        let id = canonical_query_label(&rule.name, mapping).into_owned();
+        self.reads.incomplete.insert(id.clone());
+        let inputs = self.reads.deferred_bindings.entry(id).or_default();
+        let ordinary: BTreeSet<_> = rule
+            .rule_input
+            .iter()
+            .map(|label| canonical_query_label(label, mapping).into_owned())
+            .collect();
+        if let Some(attribute) = attribute {
+            // Record possible values without requesting either select branch. The
+            // select key is a condition, not the supplier of the forwarded value.
+            let alternatives = attribute
+                .selector_list
+                .as_option()
+                .into_iter()
+                .flat_map(|list| &list.elements)
+                .flat_map(|selector| &selector.entries)
+                .flat_map(|entry| entry.string_value.iter().chain(&entry.string_list_value));
+            for value in attribute
+                .string_value
+                .iter()
+                .chain(&attribute.string_list_value)
+                .chain(alternatives)
+            {
+                let value = canonical_query_label(value, mapping).into_owned();
+                if ordinary.contains(&value) {
+                    inputs.insert(value);
+                }
+            }
+        } else {
+            // A failed structural read only supplied the ordinary inputs.
+            inputs.extend(ordinary);
+        }
+    }
+
+    fn incomplete<'a>(&mut self, names: impl IntoIterator<Item = &'a String>) {
+        let mapping = self.mapping;
+        self.reads.incomplete.extend(
+            names
+                .into_iter()
+                .map(|name| canonical_query_label(name, mapping).into_owned()),
+        );
+    }
+}
+
+/// Bazel serializes the native toolchain rule's LABEL_LIST normally and its
+/// NODEP_LABEL_LIST as STRING_LIST with nodep=true. A select retains that element type.
+fn declaration_target_settings(attribute: &Attribute) -> Option<Vec<&str>> {
+    use crate::proto::blaze_query::attribute::Discriminator;
+    let expected = if attribute.nodep == Some(true) {
+        Discriminator::StringList
+    } else {
+        Discriminator::LabelList
+    };
+    let values: Vec<_> = if attribute.r#type == expected {
+        attribute
+            .string_list_value
+            .iter()
+            .map(String::as_str)
+            .collect()
+    } else if attribute.r#type == Discriminator::SelectorList {
+        let select = attribute.selector_list.as_option()?;
+        if !select.r#type.is_some_and(|kind| kind == expected) {
+            return None;
+        }
+        select
+            .elements
+            .iter()
+            .flat_map(|element| &element.entries)
+            .flat_map(|entry| &entry.string_list_value)
+            .map(String::as_str)
+            .collect()
+    } else {
+        return None;
+    };
+    values
+        .iter()
+        .all(|value| !value.is_empty() && !value.starts_with("@@["))
+        .then_some(values)
+}
+
+fn structural_labels(attribute: &Attribute) -> impl Iterator<Item = &String> {
+    attribute.string_value.iter().chain(
+        attribute
+            .selector_list
+            .as_option()
+            .into_iter()
+            .flat_map(|list| &list.elements)
+            .flat_map(|selector| &selector.entries)
+            .filter_map(|entry| entry.string_value.as_ref()),
+    )
+}
+
+fn alias_leaves(
+    label: &str,
+    aliases: &BTreeMap<String, Vec<String>>,
+    leaves: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut reached = alias_closure(vec![label.to_owned()], aliases);
+    reached.retain(|candidate| leaves.contains(candidate));
+    reached
+}
+
+fn alias_closure(
+    mut work: Vec<String>,
+    aliases: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut checked = BTreeSet::new();
+    while let Some(next) = work.pop() {
+        if checked.insert(next.clone()) {
+            if let Some(children) = aliases.get(&next) {
+                work.extend(children.iter().cloned());
+            }
+        }
+    }
+    checked
+}
+
+/// Ordered canonical MODULE registration targets from a complete successful producer result.
+/// This excludes configuration, platform and transition additions and target_settings filtering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ModuleToolchainRegistrations {
+    pub(crate) labels: Vec<String>,
+}
+
+impl ModuleToolchainRegistrations {
+    fn from_graph(graph: &serde_json::Value) -> Option<Self> {
+        let registrations = graph.get("moduleToolchainRegistrations")?.as_array()?;
+        let mut seen = HashSet::new();
+        let labels = registrations
+            .iter()
+            .map(|value| {
+                let label = value.as_str()?;
+                let canonical = label
+                    .strip_prefix("//")
+                    .is_some_and(|target| !target.is_empty())
+                    || label
+                        .strip_prefix("@@")
+                        .and_then(|label| label.split_once("//"))
+                        .is_some_and(|(repo, target)| !repo.is_empty() && !target.is_empty());
+                if !canonical || !seen.insert(label) {
+                    return None;
+                }
+                Some(label.to_owned())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { labels })
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RepositoryTraversal<'a> {
+    Ordinary,
+    Conditions,
+    ProviderLiterals,
+    ReaderLiterals(&'a BTreeSet<String>),
+}
+
+impl RepositoryTraversal<'_> {
+    fn is_literal(self) -> bool {
+        matches!(self, Self::ProviderLiterals | Self::ReaderLiterals(_))
+    }
+
+    fn is_reader(self) -> bool {
+        matches!(self, Self::ReaderLiterals(_))
+    }
+}
+
+pub(crate) struct LiteralToolchainRows {
+    pub(crate) rows: Vec<Target>,
+    /// The literal query completed normally, without an error diagnostic. Callers
+    /// still need to check that the particular target and inputs they use exist.
+    pub(crate) complete: bool,
+}
+
+/// Loading facts about MODULE registrations. This does not cover platform flags,
+/// extra_toolchains, configured compatibility, or selected execution groups.
+#[derive(Default)]
+pub(crate) struct StaticToolchains {
+    pub(crate) registration_order: Vec<String>,
+    /// Source files and actual package groups verified by a strict literal read.
+    pub(crate) non_reader_inputs: BTreeSet<String>,
+    /// Actual bindings of already-returned local registration aliases. A
+    /// failed strict read keeps only a conservative ordinary-input witness.
+    pub(crate) local_registration_aliases: BTreeMap<String, Vec<String>>,
+
+    /// Eligibility labels evaluated separately from the declaration in the consumer's configuration.
+    pub(crate) nodep_settings: BTreeMap<String, BTreeSet<String>>,
+    /// Settings of unregistered declarations named by ordinary returned rules.
+    local_setting_inputs: BTreeSet<String>,
+    /// Native declaration labels and their NODEP implementation alternatives.
+    pub(crate) declarations: BTreeMap<String, StaticToolchainDeclaration>,
+    /// Alias and declaration rows on positively observed registration paths.
+    pub(crate) registration_paths: BTreeMap<String, RegistrationPath>,
+    /// Actual alias and native toolchain_type rows joining each required type to
+    /// its registered declarations. Equal keys can match without a physical row.
+    pub(crate) type_paths: BTreeMap<String, BTreeSet<String>>,
+    /// Each literal registration alias and type alias keeps its own destinations.
+    pub(crate) aliases: BTreeMap<String, Vec<String>>,
+    /// Contributions to a rule's direct hash, separately named so an explicitly
+    /// ignored attribute stays ignored. Structural graph edges are kept separately.
+    pub(crate) bindings: BTreeMap<String, Vec<(&'static str, [u8; 32])>>,
+    /// Ordered registration literals, not the final declaration after alias expansion.
+    pub(crate) by_type: BTreeMap<String, Vec<String>>,
+    /// Unavailable or structurally unverifiable declaration/type labels.
+    pub(crate) unresolved: BTreeSet<String>,
+    native_types: BTreeSet<String>,
+}
+pub(crate) struct StaticToolchainDeclaration {
+    pub(crate) ty: String,
+    pub(crate) implementations: BTreeSet<String>,
+    /// Ordinary inputs actually reported on the declaration.
+    pub(crate) ordinary_inputs: BTreeSet<String>,
+}
+#[derive(Clone, Default)]
+pub(crate) struct RegistrationPath {
+    pub(crate) aliases: BTreeSet<String>,
+    pub(crate) declarations: BTreeSet<String>,
+}
+
+impl StaticToolchains {
+    /// Equal canonical type spellings match directly. An alias additionally
+    /// matches the native toolchain_type leaves found in its returned branches.
+    pub(crate) fn possible_type_keys(&self, ty: &str) -> BTreeSet<String> {
+        let mut keys = alias_leaves(ty, &self.aliases, &self.native_types);
+        keys.insert(ty.to_owned());
+        keys
+    }
+
+    /// A configurable registered alias can name declarations of different types.
+    /// Keep only branches that lead to a declaration matching this requirement.
+    pub(crate) fn registration_path_for(
+        &self,
+        required: &str,
+        registration: &str,
+    ) -> Option<Cow<'_, RegistrationPath>> {
+        let path = self.registration_paths.get(registration)?;
+        let types = self.type_paths.get(required)?;
+        let matches = |name: &String| {
+            let ty = &self.declarations[name].ty;
+            ty == required || types.contains(ty)
+        };
+        if path.declarations.is_empty() {
+            return None;
+        }
+        if path.declarations.iter().all(matches) {
+            return Some(Cow::Borrowed(path));
+        }
+        let declarations: BTreeSet<_> = path
+            .declarations
+            .iter()
+            .filter(|name| matches(name))
+            .cloned()
+            .collect();
+        if declarations.is_empty() {
+            return None;
+        }
+        let mut aliases = self.observed_path(registration, &declarations);
+        aliases.retain(|name| !declarations.contains(name));
+        Some(Cow::Owned(RegistrationPath {
+            declarations,
+            aliases,
+        }))
+    }
+
+    fn observed_path(&self, literal: &str, leaves: &BTreeSet<String>) -> BTreeSet<String> {
+        if leaves.is_empty() {
+            return BTreeSet::new();
+        }
+        // In an acyclic graph keep both parents of a diamond. In an unresolved
+        // cycle keep witness prefixes and cut edges back to active ancestors.
+        let mut seen = BTreeSet::from([literal]);
+        let mut active = seen.clone();
+        let mut stack = vec![(literal, 0)];
+        let mut parents = BTreeMap::<&str, Vec<&str>>::new();
+        while let Some((label, next)) = stack.last_mut() {
+            let label = *label;
+            let Some(child) = self
+                .aliases
+                .get(label)
+                .and_then(|children| children.get(*next))
+            else {
+                active.remove(label);
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            let child = child.as_str();
+            if active.contains(child) {
+                continue;
+            }
+            parents.entry(child).or_default().push(label);
+            if seen.insert(child) {
+                active.insert(child);
+                stack.push((child, 0));
+            }
+        }
+        let mut path = BTreeSet::new();
+        let mut pending: Vec<_> = seen
+            .into_iter()
+            .filter(|name| leaves.contains(*name))
+            .collect();
+        while let Some(label) = pending.pop() {
+            if path.insert(label.to_owned()) {
+                pending.extend(parents.get(label).into_iter().flatten().copied());
+            }
+        }
+        path
+    }
+
+    pub(crate) fn declaration_forwarders(&self) -> BTreeSet<String> {
+        let declarations = self.declarations.keys().cloned().collect();
+        closed_aliases(
+            self.aliases.iter().chain(&self.local_registration_aliases),
+            &declarations,
+            &self.unresolved,
+        )
+    }
+
+    fn index_types(&mut self, required: &BTreeSet<String>) {
+        let known: BTreeSet<_> = self.declarations.keys().cloned().collect();
+        let complete_registrations = closed_aliases(&self.aliases, &known, &self.unresolved);
+        self.unresolved.extend(
+            self.registration_order
+                .iter()
+                .filter(|s| !complete_registrations.contains(*s))
+                .cloned(),
+        );
+        let complete_types = closed_aliases(&self.aliases, &self.native_types, &self.unresolved);
+        self.unresolved.extend(
+            required
+                .iter()
+                .chain(self.declarations.values().map(|d| &d.ty))
+                .filter(|s| !complete_types.contains(*s))
+                .cloned(),
+        );
+        let mut ordered = BTreeMap::<String, Vec<String>>::new();
+        let mut type_spellings = BTreeMap::<String, BTreeSet<String>>::new();
+        for registration in &self.registration_order {
+            let (declarations, aliases) = self
+                .observed_path(registration, &known)
+                .into_iter()
+                .partition(|name| known.contains(name));
+            let path = RegistrationPath {
+                aliases,
+                declarations,
+            };
+            let mut types = BTreeSet::new();
+            for label in &path.declarations {
+                let declaration = &self.declarations[label];
+                if !complete_types.contains(&declaration.ty) {
+                    self.unresolved.insert(registration.clone());
+                }
+                // Equal canonical keys can be joined even if the toolchain_type row
+                // itself was not in the ordinary target set.
+                types.insert(declaration.ty.clone());
+                for leaf in alias_leaves(&declaration.ty, &self.aliases, &self.native_types) {
+                    type_spellings
+                        .entry(leaf.clone())
+                        .or_default()
+                        .insert(declaration.ty.clone());
+                    types.insert(leaf);
+                }
+            }
+            for ty in types {
+                ordered.entry(ty).or_default().push(registration.clone());
+            }
+            self.registration_paths.insert(registration.clone(), path);
+        }
+        for ty in required {
+            let mut family = alias_leaves(ty, &self.aliases, &self.native_types);
+            let active: BTreeSet<_> = family
+                .iter()
+                .filter(|leaf| type_spellings.contains_key(*leaf))
+                .cloned()
+                .collect();
+            let mut nodes = self.observed_path(ty, &active);
+            let spellings: BTreeSet<_> = active
+                .iter()
+                .filter_map(|leaf| type_spellings.get(leaf))
+                .flatten()
+                .collect();
+            for spelling in spellings {
+                nodes.extend(self.observed_path(spelling, &active));
+            }
+            self.type_paths.insert(ty.clone(), nodes);
+            family.insert(ty.clone());
+            let literals: BTreeSet<_> = family
+                .iter()
+                .filter_map(|key| ordered.get(key))
+                .flatten()
+                .collect();
+            let labels = self
+                .registration_order
+                .iter()
+                .filter(|label| literals.contains(label))
+                .cloned()
+                .collect();
+            self.by_type.insert(ty.clone(), labels);
+        }
+    }
+}
+
+/// An alias with an unavailable branch or an unresolved cycle can still have a
+/// known alternative. It must not be advertised as a fully verified binding.
+fn closed_aliases<'a>(
+    aliases: impl IntoIterator<Item = (&'a String, &'a Vec<String>)>,
+    leaves: &BTreeSet<String>,
+    blocked: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut parents = BTreeMap::<&str, Vec<&str>>::new();
+    let mut pending = BTreeMap::new();
+    for (alias, inputs) in aliases {
+        if blocked.contains(alias) {
+            continue;
+        }
+        pending.insert(alias.as_str(), inputs.len());
+        for input in inputs {
+            parents.entry(input.as_str()).or_default().push(alias);
+        }
+    }
+    let mut known: BTreeSet<_> = leaves.difference(blocked).cloned().collect();
+    let mut work: Vec<_> = leaves.difference(blocked).map(String::as_str).collect();
+    while let Some(label) = work.pop() {
+        for &parent in parents.get(label).into_iter().flatten() {
+            let count = pending.get_mut(parent).expect("indexed alias");
+            *count -= 1;
+            if *count == 0 && known.insert(parent.to_owned()) {
+                work.push(parent);
+            }
+        }
+    }
+    known
 }
 
 /// Targets with the accepted module graph and successful unfiltered root mapping from discovery.
 pub(crate) struct QueriedTargets {
+    pub(crate) direct_toolchain_inputs: bool,
     pub(crate) targets: Vec<Target>,
     pub(crate) module_graph_json: Option<String>,
     pub(crate) root_mapping: Option<Vec<u8>>,
+    pub(crate) static_toolchains: Option<StaticToolchains>,
     pub(crate) scoped_sources: ScopedSources,
     /// The output base `bazel info` reported before the query, when it was asked.
     pub(crate) output_base: Option<PathBuf>,
@@ -2575,6 +5225,8 @@ pub(crate) struct QueriedTargets {
 #[derive(Default)]
 struct BzlmodRepos {
     targets: Vec<Target>,
+    /// Canonical names from RepoSpecs actually returned by Bazel.
+    shown_repositories: BTreeSet<String>,
     scope: IsolatedRepoScope,
     /// Extension diagnostics and canonical repositories whose mappings failed.
     failed_extensions: FailedExtensions,
@@ -2582,6 +5234,7 @@ struct BzlmodRepos {
     canonical_to_apparent: BTreeMap<String, Vec<String>>,
     /// The accepted module graph, shared by repository edges and hash-file metadata.
     module_graph_json: Option<String>,
+    toolchain_registrations: Option<ModuleToolchainRegistrations>,
     /// Unfiltered stdout from a successful initial Bzlmod probe, shared with external hashing.
     root_mapping: Option<Vec<u8>>,
 }
@@ -2663,11 +5316,61 @@ fn chunk_arguments(arguments: &[String], budget: usize) -> Vec<&[String]> {
 
 pub(crate) type RepositoryInputs = Arc<RepositoryInputGroup>;
 
+// '!' is outside Bazel's repository-name alphabet.
+
+pub(crate) const IMPORT_FALLBACK_PREFIX: &str = "//external:!unresolved-import-";
+pub(crate) const MODULE_FALLBACK_PREFIX: &str = "//external:!unresolved-module-";
+
+fn repository_fallback_identity(name: &str) -> Option<(&str, &str)> {
+    name.strip_prefix(IMPORT_FALLBACK_PREFIX)
+        .or_else(|| name.strip_prefix(MODULE_FALLBACK_PREFIX))?
+        .split_once('!')
+}
+
+pub(crate) fn is_repository_fallback(name: &str) -> bool {
+    repository_fallback_identity(name).is_some()
+}
+
+pub(crate) fn repository_fallbacks(
+    targets: &[Target],
+    fine: &BTreeSet<String>,
+) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for row in targets {
+        let Some(name) = target_name(row) else {
+            continue;
+        };
+        let Some((canonical, apparent)) = repository_fallback_identity(name) else {
+            continue;
+        };
+        let own = format!("@{apparent}");
+        let known = format!("@@{canonical}");
+        if fine.contains(&own)
+            || fine.contains(&known)
+            || fine.contains(apparent)
+            || fine.contains(canonical)
+        {
+            continue;
+        }
+        result.insert(own, name.to_owned());
+        result.entry(known).or_insert_with(|| name.to_owned());
+    }
+    result
+}
+
+pub(crate) fn repository_fallback<'a>(
+    label: &str,
+    fallbacks: &'a HashMap<String, String>,
+) -> Option<&'a String> {
+    fallbacks.get(label.split_once("//")?.0)
+}
+
 pub(crate) struct RepositoryInputGroup {
     pub(crate) extension: String,
     pub(crate) labels: Vec<String>,
 }
 
+#[cfg(test)]
 fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<RepositoryInputs>) {
     if let Some(inputs) = inputs {
         for target in batch {
@@ -2676,6 +5379,7 @@ fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<
     }
 }
 
+#[cfg(test)]
 fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
     if let Some(inputs) = shared {
         target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
@@ -2732,21 +5436,13 @@ fn lower_repositories(
         }
     }
 
-    // Query mode cannot see how a target reaches an extension's repositories: a toolchain is
-    // resolved rather than declared, and a hub's aliases live in a BUILD file the query never
-    // loads. Two conservative stand-ins keep the change reachable: the module that owns an
-    // extension depends on everything it generates (every rules_go target names `@rules_go//`),
-    // and each imported repository of an extension depends on the siblings nobody imports (the
-    // `@bd_crates` hub reaches its `bd_crates__*` spokes). Spokes themselves stay leaves, so no
-    // cycle forms.
-    // An extension the user lists in `label_only_module_extensions` gets no owner edges: the user
-    // asserts that its repositories are reached only through labels, which the query reports,
-    // never through a resolved toolchain. Otherwise every target of the owning module, of every
-    // module with a `bazel_dep` path to it, and every fine-grained spoke would change whenever
-    // any repository of the extension does (issue #603). It is opt-in because a toolchain
-    // resolved from one of them is invisible to a query, however it is registered.
-    // An explicitly label-only imported repository needs no owner fallback. Its own node,
-    // the hub-to-spoke inputs and the owner's edges to other generators remain.
+    // Query mode can omit resolved toolchains and targets outside the queried repositories.
+    // Generated inventories are fallback inputs, separate from module definitions and declared
+    // module dependencies. Hashing uses them for unresolved readers; verified ordinary labels
+    // follow their actual targets. This retains the hidden SDK and hub fallbacks from #529.
+    // An extension listed in `label_only_module_extensions` contributes no owner fallback inputs:
+    // the caller asserts that its repositories are reached only through labels. Other extension
+    // usages and the imported-repository fallbacks retain their existing contracts (#603).
     let mut module_extension_repos = BTreeMap::<String, BTreeSet<String>>::new();
     let mut extension_spokes = BTreeMap::<String, BTreeSet<String>>::new();
     if let Some(imported) = extension_edges {
@@ -2778,6 +5474,40 @@ fn lower_repositories(
         }
     }
 
+    let module_dependencies = module_to_canonical
+        .iter()
+        .map(|(module, canonical)| {
+            let dependencies = module_edges
+                .get(module)
+                .into_iter()
+                .flatten()
+                .filter_map(|dependency| module_to_canonical.get(dependency))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            (canonical.clone(), dependencies)
+        })
+        .collect::<BTreeMap<_, _>>();
+    // A module's unresolved reader previously reached generated repositories through
+    // its declared module dependencies too. Keep that relation among fallback nodes.
+    let mut parents = HashMap::<&str, Vec<&str>>::new();
+    for (module, dependencies) in &module_dependencies {
+        for dependency in dependencies {
+            parents
+                .entry(dependency.as_str())
+                .or_default()
+                .push(module.as_str());
+        }
+    }
+    let mut fallback_modules = HashSet::new();
+    let mut pending: Vec<_> = module_extension_repos.keys().map(String::as_str).collect();
+    while let Some(module) = pending.pop() {
+        if fallback_modules.insert(module) {
+            if let Some(ancestors) = parents.get(module) {
+                pending.extend(ancestors);
+            }
+        }
+    }
+
     let mut targets = Vec::new();
     let mut shared_groups = HashMap::<String, RepositoryInputs>::new();
     let empty = BTreeSet::new();
@@ -2787,17 +5517,28 @@ fn lower_repositories(
         let owner_definition_hash = extension
             .and_then(|extension| extension_repo_owner(extension, &module_definitions))
             .map(|(_module_repo, definition_hash)| definition_hash.as_str());
-        let module = (canonical.matches('+').count() == 1)
-            .then(|| canonical.split('+').next().unwrap_or(canonical));
-        let mut dependencies = module
+        let mut dependencies = module_dependencies
+            .get(canonical)
             .into_iter()
-            .flat_map(|module| module_edges.get(module).into_iter().flatten())
-            .filter_map(|dependency| module_to_canonical.get(dependency))
+            .flatten()
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
-        if let Some(repos) = module_extension_repos.get(canonical) {
-            dependencies.extend(repos.iter().cloned());
-        }
+        let module_fallback = fallback_modules.contains(canonical).then(|| {
+            let mut inputs = module_extension_repos
+                .get(canonical)
+                .into_iter()
+                .flatten()
+                .map(|name| format!("//external:{name}"))
+                .collect::<BTreeSet<_>>();
+            for dependency in module_dependencies.get(canonical).into_iter().flatten() {
+                if fallback_modules.contains(dependency.as_str()) {
+                    inputs.extend(node_names(dependency).into_iter().map(|apparent| {
+                        format!("{MODULE_FALLBACK_PREFIX}{dependency}!{apparent}")
+                    }));
+                }
+            }
+            (canonical.to_owned(), inputs)
+        });
         let spokes = extension
             .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
             .and_then(|extension| extension_spokes.get_key_value(extension));
@@ -2813,6 +5554,8 @@ fn lower_repositories(
         if names.is_empty() {
             continue;
         }
+        let group_identity =
+            (!label_only.owner_exemptions.contains(canonical)).then(|| canonical.to_owned());
         let files = module_files
             .remove(&index)
             .unwrap_or_else(|| prepare_repository(&mut repository, &workspace));
@@ -2840,7 +5583,37 @@ fn lower_repositories(
                 None => (&dependencies, None),
             };
             let mut target = repository_target(rules.next().unwrap(), &apparent, inputs);
-            transform(&mut target, shared);
+            if let Some((canonical, inputs)) = &module_fallback {
+                let mut fallback = Target {
+                    r#type: target::Discriminator::Rule,
+                    rule: buffa::MessageField::some(Rule {
+                        name: format!("{MODULE_FALLBACK_PREFIX}{canonical}!{apparent}"),
+                        rule_class: "_bazel_diff_unresolved_module".to_owned(),
+                        rule_input: inputs.iter().cloned().collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                transform(&mut fallback, None);
+                targets.push(fallback);
+            }
+            match (shared, group_identity.as_deref()) {
+                (Some(group), Some(canonical)) => {
+                    let mut fallback = Target {
+                        r#type: target::Discriminator::Rule,
+                        rule: buffa::MessageField::some(Rule {
+                            name: format!("{IMPORT_FALLBACK_PREFIX}{canonical}!{apparent}"),
+                            rule_class: "_bazel_diff_unresolved_import".to_owned(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    transform(&mut fallback, Some(group));
+                    targets.push(fallback);
+                    transform(&mut target, None);
+                }
+                (shared, _) => transform(&mut target, shared),
+            }
             targets.push(target);
         }
     }
@@ -3037,13 +5810,14 @@ fn decode_target_stream(
     path: &Path,
     transform: &mut impl FnMut(&mut [Target]),
 ) -> Result<Vec<Target>> {
-    decode_target_stream_filtered(path, transform, |_| true)
+    decode_target_stream_filtered(path, transform, |_| true, false)
 }
 
 fn decode_target_stream_filtered(
     path: &Path,
     transform: &mut impl FnMut(&mut [Target]),
-    retain: impl Fn(&Target) -> bool,
+    mut retain: impl FnMut(&Target) -> bool,
+    keep_class_keys: bool,
 ) -> Result<Vec<Target>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut targets = Vec::new();
@@ -3055,13 +5829,13 @@ fn decode_target_stream_filtered(
             .map(|bytes| {
                 <Target as Message>::decode_from_slice(bytes)
                     .map_err(anyhow::Error::from)
-                    .map(lower_query_target)
+                    .map(|target| lower_target_with_class_keys(target, keep_class_keys))
             })
             .collect_into_vec(&mut decoded);
         let start = targets.len();
         targets.reserve(decoded.len());
         for lowered in decoded.drain(..) {
-            if let Some(target) = lowered?.filter(&retain) {
+            if let Some(target) = lowered?.filter(&mut retain) {
                 targets.push(target);
             }
         }
@@ -3287,7 +6061,7 @@ pub fn target_name(target: &Target) -> Option<&str> {
     }
 }
 
-fn lower_query_target(mut target: Target) -> Option<Target> {
+fn add_legacy_toolchain_inputs(target: &mut Target) {
     if let Some(rule) = target
         .rule
         .as_option_mut()
@@ -3313,22 +6087,25 @@ fn lower_query_target(mut target: Target) -> Option<Target> {
             }
         }
     }
-    lower_target(target)
 }
 
-fn lower_target(mut target: Target) -> Option<Target> {
+fn lower_target(target: Target) -> Option<Target> {
+    lower_target_with_class_keys(target, false)
+}
+
+fn lower_target_with_class_keys(mut target: Target, keep_class_keys: bool) -> Option<Target> {
     match target.r#type {
         target::Discriminator::Rule
         | target::Discriminator::SourceFile
         | target::Discriminator::GeneratedFile => {
-            compact_target(&mut target);
+            compact_target(&mut target, keep_class_keys);
             Some(target)
         }
         target::Discriminator::PackageGroup => {
             let group = target.package_group.take()?;
             target.r#type = target::Discriminator::Rule;
             target.rule = buffa::MessageField::some(package_group_rule(&group));
-            compact_target(&mut target);
+            compact_target(&mut target, false);
             Some(target)
         }
         target::Discriminator::EnvironmentGroup => {
@@ -3338,7 +6115,181 @@ fn lower_target(mut target: Target) -> Option<Target> {
     }
 }
 
-fn compact_target(target: &mut Target) {
+fn retained_class_key(key: &str) -> bool {
+    matches!(
+        key,
+        "alias" | "filegroup" | "package_group" | "toolchain" | "toolchain_type"
+    ) || is_condition_class(key)
+}
+
+struct StockRuleClass {
+    representative: usize,
+    members: Vec<usize>,
+}
+
+#[derive(Default)]
+struct StockWalk {
+    inputs: BTreeMap<String, BTreeSet<String>>,
+    returned: BTreeSet<String>,
+    unrecognized: BTreeSet<String>,
+    complete: bool,
+}
+
+impl StockWalk {
+    fn has_input(&self, owner: &str, input: &str) -> Option<bool> {
+        if self
+            .inputs
+            .get(owner)
+            .is_some_and(|inputs| inputs.contains(input))
+        {
+            return Some(true);
+        }
+        (self.complete && self.returned.contains(owner) && !self.unrecognized.contains(owner))
+            .then_some(false)
+    }
+}
+
+#[derive(Default)]
+struct StockFlat {
+    inputs: BTreeMap<String, BTreeSet<String>>,
+    complete: bool,
+}
+
+impl StockFlat {
+    fn inputs(&self, owner: &str) -> Option<&BTreeSet<String>> {
+        if self.complete {
+            self.inputs.get(owner)
+        } else {
+            None
+        }
+    }
+}
+
+fn queue_stock_inputs(
+    walk: &StockWalk,
+    samples: &BTreeMap<String, Vec<usize>>,
+    targets: &[Target],
+    mapping: &HashMap<String, String>,
+    inputs: &mut BTreeMap<usize, BTreeSet<String>>,
+) {
+    for (owner, values) in &walk.inputs {
+        if let Some(indices) = samples.get(owner) {
+            for &index in indices {
+                let rule = targets[index].rule.as_option().expect("indexed rule");
+                let ordinary = rule
+                    .rule_input
+                    .iter()
+                    .map(|input| canonical_query_label(input, mapping).into_owned())
+                    .collect::<HashSet<_>>();
+                inputs.entry(index).or_default().extend(
+                    values
+                        .iter()
+                        .filter(|value| !ordinary.contains(*value))
+                        .cloned(),
+                );
+            }
+        }
+    }
+}
+
+fn queue_stock_uncertainty(
+    uncertain: &mut BTreeMap<usize, BTreeSet<String>>,
+    group: usize,
+    input: &str,
+) {
+    if let Some((repository, _)) = input
+        .strip_prefix("@@")
+        .and_then(|label| label.split_once("//"))
+    {
+        if !repository.is_empty() {
+            uncertain
+                .entry(group)
+                .or_default()
+                .insert(repository.to_owned());
+        }
+    }
+}
+
+fn add_stock_inputs(
+    targets: &mut [Target],
+    members: &[usize],
+    inputs: &BTreeSet<String>,
+    mapping: &HashMap<String, String>,
+    observed: &HashMap<String, usize>,
+) {
+    let inputs = inputs
+        .iter()
+        .map(|input| {
+            let spelling = observed
+                .get(input)
+                .and_then(|&index| target_name(&targets[index]))
+                .unwrap_or(input)
+                .to_owned();
+            (input, spelling)
+        })
+        .collect::<Vec<_>>();
+    for &index in members {
+        let rule = targets[index].rule.as_option_mut().expect("indexed rule");
+        let mut present = rule
+            .rule_input
+            .iter()
+            .map(|input| canonical_query_label(input, mapping).into_owned())
+            .collect::<HashSet<_>>();
+        for (input, spelling) in &inputs {
+            if present.insert((*input).clone()) {
+                rule.rule_input.push(spelling.clone());
+            }
+        }
+    }
+}
+
+/// Bazel's key identifies one RuleClass and its default toolchain requirements.
+/// Stop carrying full keys as soon as the primary rows have stable indices.
+fn take_stock_rule_classes(
+    targets: &mut [Target],
+    mapping: &HashMap<String, String>,
+) -> BTreeMap<String, StockRuleClass> {
+    let mut members_by_key = BTreeMap::<String, Vec<usize>>::new();
+    for (index, target) in targets.iter_mut().enumerate() {
+        let Some(rule) = target.rule.as_option_mut() else {
+            continue;
+        };
+        let Some(key) = rule.rule_class_key.take() else {
+            continue;
+        };
+        if retained_class_key(&key) {
+            rule.rule_class_key = Some(key.clone());
+        }
+        // Bzlmod inventory rows and normalized package groups have synthetic Rule identities.
+        if !key.is_empty() && !rule.name.starts_with("//external:") && key != "package_group" {
+            members_by_key.entry(key).or_default().push(index);
+        }
+    }
+    members_by_key
+        .into_iter()
+        .filter_map(|(key, members)| {
+            let representative = members
+                .iter()
+                .filter_map(|&index| {
+                    let name = target_name(&targets[index])?;
+                    let canonical = canonical_query_label(name, mapping);
+                    // DOT writes target labels without quoting embedded double quotes.
+                    (!canonical.contains('"')).then_some((canonical, name, index))
+                })
+                .min()?
+                .2;
+            Some((
+                key,
+                StockRuleClass {
+                    representative,
+                    members,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn compact_target(target: &mut Target, keep_class_keys: bool) {
     target.__buffa_unknown_fields.clear();
     match target.r#type {
         target::Discriminator::Rule => {
@@ -3351,7 +6302,12 @@ fn compact_target(target: &mut Target) {
             rule.DEPRECATED_public_by_default = None;
             rule.DEPRECATED_is_skylark = None;
             rule.definition_stack.clear();
-            if rule.rule_class_key.as_deref() != Some("alias") {
+            if !keep_class_keys
+                && !rule
+                    .rule_class_key
+                    .as_deref()
+                    .is_some_and(retained_class_key)
+            {
                 rule.rule_class_key = None;
             }
             rule.__buffa_unknown_fields.clear();
@@ -3389,6 +6345,8 @@ fn package_group_rule(group: &PackageGroup) -> Rule {
     let mut rule = Rule {
         name: group.name.clone(),
         rule_class: "package_group".to_owned(),
+        // The wire target is a PackageGroup, not a same-named Starlark rule.
+        rule_class_key: Some("package_group".to_owned()),
         ..Default::default()
     };
     rule.attribute.push(packages);
@@ -4021,6 +6979,206 @@ mod tests {
     }
 
     #[test]
+    fn static_toolchain_scope_accepts_worker_serialization_and_strictness() {
+        let mut options = probe_options(Path::new("."), PathBuf::from("unused"));
+        options.command_options = [
+            "--proto:output_rule_attrs=tags",
+            "--proto:include_synthetic_attribute_hash",
+            "--curses=no",
+            "--nokeep_going",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert!(options.static_toolchain_scope_matches());
+        options
+            .command_options
+            .push("--override_module=provider=/workspace/provider".into());
+        assert!(!options.static_toolchain_scope_matches());
+    }
+
+    #[test]
+    fn module_toolchain_registrations_preserve_order_and_reject_invalid_fields() {
+        let parse = |labels: &str| {
+            let graph =
+                serde_json::from_str(&format!(r#"{{"moduleToolchainRegistrations":{labels}}}"#))
+                    .unwrap();
+            ModuleToolchainRegistrations::from_graph(&graph)
+        };
+        let first = parse(r#"["//:second","//:first","@@provider+//:explicit"]"#).unwrap();
+        assert_eq!(
+            first.labels,
+            ["//:second", "//:first", "@@provider+//:explicit"]
+        );
+        assert_ne!(
+            first,
+            parse(r#"["//:first","//:second","@@provider+//:explicit"]"#).unwrap()
+        );
+        assert!(parse("[]").unwrap().labels.is_empty());
+        assert!(ModuleToolchainRegistrations::from_graph(&serde_json::json!({})).is_none());
+        for invalid in [
+            r#"["@provider//:apparent"]"#,
+            r#"["//:first","//:first"]"#,
+            "[1]",
+            "null",
+        ] {
+            assert!(parse(invalid).is_none(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn static_module_registrations_preserve_known_paths_and_unresolved_choices() {
+        let decl = |ty: &str| StaticToolchainDeclaration {
+            ty: ty.into(),
+            implementations: BTreeSet::from(["//impl:tool".into()]),
+            ordinary_inputs: BTreeSet::new(),
+        };
+        let mut graph = StaticToolchains {
+            registration_order: ["//:second", "//:mixed", "//:first", "//:missing"]
+                .map(str::to_owned)
+                .to_vec(),
+            declarations: BTreeMap::from([
+                ("//:second".into(), decl("//:type")),
+                ("//:first".into(), decl("//:type_alias")),
+                // Exposed on the ordinary graph but never registered with MODULE.
+                ("//:available_only".into(), decl("//:type")),
+                ("//:same_key".into(), decl("//:absent_type")),
+            ]),
+            aliases: BTreeMap::from([
+                (
+                    "//:mixed".into(),
+                    vec!["//:first".into(), "//:cycle".into()],
+                ),
+                ("//:cycle".into(), vec!["//:mixed".into()]),
+                (
+                    "//:type_alias".into(),
+                    vec!["//:middle_type".into(), "//:other_type".into()],
+                ),
+                ("//:middle_type".into(), vec!["//:type".into()]),
+                (
+                    "//:required_spelling".into(),
+                    vec!["//:type".into(), "//:reader_only_leaf".into()],
+                ),
+            ]),
+            native_types: BTreeSet::from([
+                "//:type".into(),
+                "//:other_type".into(),
+                "//:reader_only_leaf".into(),
+            ]),
+            ..Default::default()
+        };
+        graph.registration_order.push("//:same_key".into());
+        // A partial query still returned the structure of first. Its positive
+        // binding can be used, but a parent literal cannot call that complete.
+        graph.unresolved.insert("//:first".into());
+        graph
+            .aliases
+            .insert("//:partial".into(), vec!["//:first".into()]);
+        graph.registration_order.push("//:partial".into());
+        graph.registration_order.push("//:diamond".into());
+        graph.aliases.insert(
+            "//:diamond".into(),
+            vec!["//:left".into(), "//:right".into()],
+        );
+        for branch in ["//:left", "//:right"] {
+            graph.aliases.insert(
+                branch.into(),
+                vec!["//:first".into(), format!("{branch}_missing")],
+            );
+        }
+        graph.index_types(&BTreeSet::from([
+            "//:type".into(),
+            "//:absent_type".into(),
+            "//:required_spelling".into(),
+        ]));
+        assert_eq!(
+            graph.type_paths["//:required_spelling"],
+            BTreeSet::from(
+                [
+                    "//:required_spelling",
+                    "//:type_alias",
+                    "//:middle_type",
+                    "//:type"
+                ]
+                .map(str::to_owned)
+            )
+        );
+        assert!(graph.type_paths["//:absent_type"].is_empty());
+        assert_eq!(
+            graph.by_type["//:type"],
+            [
+                "//:second",
+                "//:mixed",
+                "//:first",
+                "//:partial",
+                "//:diamond"
+            ]
+        );
+        assert_eq!(graph.by_type["//:absent_type"], ["//:same_key"]);
+        for missing in ["//:missing", "//:mixed", "//:absent_type", "//:partial"] {
+            assert!(graph.unresolved.contains(missing), "{missing}");
+        }
+        assert!(!graph.unresolved.contains("//:second"));
+        let mixed = &graph.registration_paths["//:mixed"];
+        assert_eq!(mixed.aliases, BTreeSet::from(["//:mixed".into()]));
+        assert_eq!(mixed.declarations, BTreeSet::from(["//:first".into()]));
+        assert!(graph.registration_paths["//:missing"]
+            .declarations
+            .is_empty());
+        let diamond = &graph.registration_paths["//:diamond"];
+        assert_eq!(
+            diamond.aliases,
+            BTreeSet::from(["//:diamond", "//:left", "//:right"].map(str::to_owned))
+        );
+        assert!(graph.unresolved.contains("//:diamond"));
+    }
+
+    #[test]
+    fn registered_select_keeps_only_the_branches_supplying_the_required_type() {
+        let mut graph = StaticToolchains {
+            registration_order: vec!["//:choice".into()],
+            aliases: BTreeMap::from([
+                (
+                    "//:choice".into(),
+                    vec!["//:a_alias".into(), "//:b_alias".into()],
+                ),
+                ("//:a_alias".into(), vec!["//:a".into()]),
+                ("//:b_alias".into(), vec!["//:b".into()]),
+                ("//:type_alias".into(), vec!["//:type_a".into()]),
+            ]),
+            declarations: [("//:a", "//:type_alias"), ("//:b", "//:type_b")]
+                .into_iter()
+                .map(|(name, ty)| {
+                    (
+                        name.into(),
+                        StaticToolchainDeclaration {
+                            ty: ty.into(),
+                            implementations: BTreeSet::new(),
+                            ordinary_inputs: BTreeSet::new(),
+                        },
+                    )
+                })
+                .collect(),
+            native_types: BTreeSet::from(["//:type_a".into()]),
+            ..Default::default()
+        };
+        // An equal canonical key still supplies a positive match when its type
+        // row is missing. The registration's completeness remains unknown.
+        graph.index_types(&BTreeSet::from(["//:type_a".into(), "//:type_b".into()]));
+        for (ty, alias, declaration) in [
+            ("//:type_a", "//:a_alias", "//:a"),
+            ("//:type_b", "//:b_alias", "//:b"),
+        ] {
+            let path = graph.registration_path_for(ty, "//:choice").unwrap();
+            assert_eq!(
+                path.aliases,
+                BTreeSet::from(["//:choice".into(), alias.into()])
+            );
+            assert_eq!(path.declarations, BTreeSet::from([declaration.into()]));
+        }
+        assert!(graph.unresolved.contains("//:choice"));
+    }
+
+    #[test]
     fn buffa_decodes_delimited_bazel_target() {
         let rule = Rule {
             name: "//foo:bar".into(),
@@ -4067,7 +7225,7 @@ mod tests {
             ..Default::default()
         });
 
-        compact_target(&mut target);
+        compact_target(&mut target, false);
 
         let rule = target.rule.as_option().unwrap();
         assert_eq!(rule.name, "//foo:bar");
@@ -4100,7 +7258,7 @@ mod tests {
             ..Default::default()
         });
 
-        compact_target(&mut target);
+        compact_target(&mut target, false);
 
         let source = target.source_file.as_option().unwrap();
         assert_eq!(source.name, "//foo:bar.txt");
@@ -4184,8 +7342,21 @@ mod tests {
         let group = lower_target(group).unwrap();
         let rule = group.rule.as_option().unwrap();
         assert_eq!(rule.rule_class, "package_group");
+        assert_eq!(rule.rule_class_key.as_deref(), Some("package_group"));
+        assert!(rule.possible_toolchain_types.as_option().is_none());
         assert_eq!(rule.rule_input, ["//pkg:base"]);
         assert_eq!(rule.attribute[0].string_list_value, ["//client/..."]);
+
+        let mut starlark_group = group;
+        starlark_group.rule.as_option_mut().unwrap().rule_class_key =
+            Some("@@//pkg:defs.bzl%package_group".into());
+        let starlark_group = lower_target(starlark_group).unwrap();
+        assert!(starlark_group
+            .rule
+            .as_option()
+            .unwrap()
+            .rule_class_key
+            .is_none());
 
         let environment = Target {
             r#type: target::Discriminator::EnvironmentGroup,
@@ -4996,7 +8167,9 @@ mod tests {
             observed,
             [
                 ("//external:before", None),
+                ("//external:!unresolved-module-dep+!a", None),
                 ("//external:a", first),
+                ("//external:!unresolved-module-dep+!b", None),
                 ("//external:b", first),
                 ("//external:dep++ext+spoke", Some(second.as_str())),
             ]
@@ -5692,7 +8865,7 @@ exit 1
     }
 
     #[test]
-    fn extension_repos_hang_off_their_module_and_hub_in_query_mode_only() {
+    fn extension_inventories_are_separate_from_definitions() {
         // Root imports `rules_go` and the `bd_crates` hub of rules_rs' crate extension; rules_go's
         // own module imports `go_toolchains`; nobody imports `go_default_sdk` or the crate spoke.
         let mapping = parse_repo_mapping(
@@ -5747,31 +8920,41 @@ exit 1
             Path::new("."),
             &mut materialize_repository_inputs,
         );
-        assert_eq!(query.len(), 8);
-        // The owning module reaches everything its extensions generate, after its module deps.
+        assert_eq!(query.len(), 12);
+        // Definitions retain declared module dependencies. Unresolved readers retain the
+        // former generated inventory through separate fallback nodes.
         assert_eq!(
             inputs_of(&query, "//external:rules_go"),
+            ["//external:rules_rs"]
+        );
+        assert!(inputs_of(&query, "//external:rules_rs").is_empty());
+        assert_eq!(
+            inputs_of(&query, "//external:!unresolved-module-rules_go+!rules_go"),
             [
+                "//external:!unresolved-module-rules_rs+!rules_rs",
                 "//external:rules_go++go_sdk+go_default_sdk",
                 "//external:rules_go++go_sdk+go_toolchains",
-                "//external:rules_rs",
             ]
         );
         assert_eq!(
-            inputs_of(&query, "//external:rules_rs"),
+            inputs_of(&query, "//external:!unresolved-module-rules_rs+!rules_rs"),
             [
                 "//external:bd_crates",
                 "//external:rules_rs++_crate+++isolated_crates+crate_repo",
                 "//external:rules_rs++crate+bd_crates__anyhow-1.0.104",
             ]
         );
-        // An imported repository reaches the siblings of its extension nobody imports.
+        // A repository definition is independent of its hidden-sibling fallback.
+        assert!(inputs_of(&query, "//external:bd_crates").is_empty());
         assert_eq!(
-            inputs_of(&query, "//external:bd_crates"),
+            inputs_of(
+                &query,
+                "//external:!unresolved-import-rules_rs++crate+bd_crates!bd_crates"
+            ),
             ["//external:rules_rs++crate+bd_crates__anyhow-1.0.104"]
         );
         assert_eq!(
-            inputs_of(&query, "//external:rules_go++go_sdk+go_toolchains"),
+            inputs_of(&query, "//external:!unresolved-import-rules_go++go_sdk+go_toolchains!rules_go++go_sdk+go_toolchains"),
             ["//external:rules_go++go_sdk+go_default_sdk"]
         );
         // Spokes stay leaves, and the root's own extension has no module node to hang off.
@@ -5783,9 +8966,8 @@ exit 1
         .is_empty());
         assert!(inputs_of(&query, "//external:+local+root_ext_repo").is_empty());
 
-        // A label-only extension's repositories leave its owner's node, while those of its other
-        // usages stay, an isolated usage of the same extension included (issue #603). The
-        // hub-to-spoke edges remain.
+        // A label-only extension leaves the owner fallback, while other usages stay,
+        // including an isolated usage of the same extension (#603).
         let label_only = lower_repositories(
             repositories(),
             &mapping,
@@ -5801,21 +8983,35 @@ exit 1
             Path::new("."),
             &mut materialize_repository_inputs,
         );
-        assert_eq!(label_only.len(), 8);
+        assert_eq!(label_only.len(), 12);
         assert_eq!(
             inputs_of(&label_only, "//external:rules_go"),
             ["//external:rules_rs"]
         );
+        assert!(inputs_of(&label_only, "//external:rules_rs").is_empty());
         assert_eq!(
-            inputs_of(&label_only, "//external:rules_rs"),
+            inputs_of(
+                &label_only,
+                "//external:!unresolved-module-rules_go+!rules_go"
+            ),
+            ["//external:!unresolved-module-rules_rs+!rules_rs"]
+        );
+        assert_eq!(
+            inputs_of(
+                &label_only,
+                "//external:!unresolved-module-rules_rs+!rules_rs"
+            ),
             ["//external:rules_rs++_crate+++isolated_crates+crate_repo"]
         );
         assert_eq!(
-            inputs_of(&label_only, "//external:bd_crates"),
+            inputs_of(
+                &label_only,
+                "//external:!unresolved-import-rules_rs++crate+bd_crates!bd_crates"
+            ),
             ["//external:rules_rs++crate+bd_crates__anyhow-1.0.104"]
         );
         assert_eq!(
-            inputs_of(&label_only, "//external:rules_go++go_sdk+go_toolchains"),
+            inputs_of(&label_only, "//external:!unresolved-import-rules_go++go_sdk+go_toolchains!rules_go++go_sdk+go_toolchains"),
             ["//external:rules_go++go_sdk+go_default_sdk"]
         );
 
@@ -6445,6 +9641,10 @@ exit 1
             names,
             BTreeSet::from([
                 "//app:lib",
+                "//external:!unresolved-import-rules_go++go_sdk+go_toolchains!rules_go++go_sdk+go_toolchains",
+                "//external:!unresolved-import-rules_python++pip+pypi!pypi",
+                "//external:!unresolved-module-rules_go+!rules_go",
+                "//external:!unresolved-module-rules_python+!rules_python",
                 "//external:pypi",
                 "//external:rules_go",
                 "//external:rules_go++go_sdk+go_default_sdk",
@@ -6464,19 +9664,30 @@ exit 1
                 .rule_input
                 .clone()
         };
+        assert!(inputs_of("//external:rules_go").is_empty());
+        assert!(inputs_of("//external:rules_python").is_empty());
         assert_eq!(
-            inputs_of("//external:rules_go"),
+            inputs_of("//external:!unresolved-module-rules_go+!rules_go"),
             [
                 "//external:rules_go++go_sdk+go_default_sdk",
                 "//external:rules_go++go_sdk+go_toolchains",
             ]
         );
         assert_eq!(
-            inputs_of("//external:pypi"),
+            inputs_of("//external:!unresolved-module-rules_python+!rules_python"),
+            [
+                "//external:pypi",
+                "//external:rules_python++pip+pypi_312_six",
+            ]
+        );
+        assert!(inputs_of("//external:pypi").is_empty());
+        assert!(inputs_of("//external:rules_go++go_sdk+go_toolchains").is_empty());
+        assert_eq!(
+            inputs_of("//external:!unresolved-import-rules_python++pip+pypi!pypi"),
             ["//external:rules_python++pip+pypi_312_six"]
         );
         assert_eq!(
-            inputs_of("//external:rules_go++go_sdk+go_toolchains"),
+            inputs_of("//external:!unresolved-import-rules_go++go_sdk+go_toolchains!rules_go++go_sdk+go_toolchains"),
             ["//external:rules_go++go_sdk+go_default_sdk"]
         );
 
@@ -6542,7 +9753,7 @@ exit 1
         };
         let options = probe_options(path, extension_flow_script(path, &[repo], None));
         let original = options
-            .query_all_targets_with(materialize_repository_inputs_for_batch)
+            .query_all_targets_with(materialize_repository_inputs_for_batch, None)
             .unwrap();
         fs::write(path.join("MODULE.bazel"), "").unwrap();
         for (marker, expected_dumps) in [
@@ -6555,7 +9766,7 @@ exit 1
             }
             fs::write(path.join("calls.log"), "").unwrap();
             let queried = options
-                .query_all_targets_with(materialize_repository_inputs_for_batch)
+                .query_all_targets_with(materialize_repository_inputs_for_batch, None)
                 .unwrap();
             assert_eq!(queried.targets, original.targets);
             assert_eq!(queried.root_mapping, original.root_mapping);
@@ -6587,12 +9798,12 @@ exit 1
         fs::remove_file(path.join("MODULE.bazel")).unwrap();
         fs::write(path.join("omit-graph-hint"), "").unwrap();
         let original = options
-            .query_all_targets_with(materialize_repository_inputs_for_batch)
+            .query_all_targets_with(materialize_repository_inputs_for_batch, None)
             .unwrap();
         fs::write(path.join("MODULE.bazel"), "").unwrap();
         fs::write(path.join("calls.log"), "").unwrap();
         let queried = options
-            .query_all_targets_with(materialize_repository_inputs_for_batch)
+            .query_all_targets_with(materialize_repository_inputs_for_batch, None)
             .unwrap();
         assert_eq!(queried.targets, original.targets);
         assert_eq!(queried.root_mapping, original.root_mapping);
@@ -6756,6 +9967,44 @@ exit 1
             .chars()
             .all(|character| character.is_ascii_hexdigit()));
         assert!(selected_repos_marker.is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn guarded_cache_distinguishes_toolchain_metadata_from_the_same_release() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let script = root.join("bazel.sh");
+        fs::write(
+            &script,
+            r#"case "$1 $2" in
+"mod dump_repo_mapping") echo '{}' ;;
+"mod graph")
+  case "$*" in
+    *--include_toolchain_registrations*) cat registrations ;;
+    *) echo '{"key":"<root>","dependencies":[]}' ;;
+  esac ;;
+"query set()") test -f typed ;;
+"mod show_repo") exit 0 ;;
+*) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let options = probe_options(root, script);
+        let fingerprint = || options.dependency_fingerprint().unwrap();
+        let ordinary = fingerprint();
+        fs::write(
+            root.join("registrations"),
+            r#"{"key":"<root>","dependencies":[],"moduleToolchainRegistrations":[]}"#,
+        )
+        .unwrap();
+        let registered = fingerprint();
+        assert_ne!(registered, ordinary);
+        fs::write(root.join("typed"), "").unwrap();
+        let typed = fingerprint();
+        assert_ne!(typed, registered);
+        assert_eq!(typed, fingerprint());
     }
 
     #[test]
@@ -7063,7 +10312,7 @@ exit 1
     fn isolated_root_requires_a_supported_complete_ordinary_survey() {
         let refuses = |options: &BazelOptions, expected: &str| {
             let mut transformed = false;
-            let result = options.query_all_targets_with(|_, _| transformed = true);
+            let result = options.query_all_targets_with(|_, _| transformed = true, None);
             let error = match result {
                 Ok(_) => panic!("isolated root unexpectedly accepted"),
                 Err(error) => error,
@@ -7480,6 +10729,22 @@ exit 1
         let targets = options.query("//app:all", false).unwrap();
         assert_eq!(
             targets.iter().filter_map(target_name).collect::<Vec<_>>(),
+            ["//app:lib"]
+        );
+
+        let partial = options
+            .exact_toolchain_rows(
+                &BTreeSet::from(["//app:lib".into()]),
+                Some(BazelVersion(8, 7, 0)),
+            )
+            .unwrap();
+        assert!(!partial.complete);
+        assert_eq!(
+            partial
+                .rows
+                .iter()
+                .filter_map(target_name)
+                .collect::<Vec<_>>(),
             ["//app:lib"]
         );
 

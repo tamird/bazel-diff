@@ -44,7 +44,7 @@ type DigestBytes = [u8; 32];
 
 /// Bumped when the recipe format or the evaluation formula changes, so an entry an older
 /// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 8;
+pub const RECIPE_VERSION: u32 = 19;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index
@@ -111,6 +111,12 @@ impl TreeIndex {
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
+    }
+
+    /// Look up one of the file or symlink blobs exposed by `content_hashes()`.
+    pub fn content_hash(&self, path: &str) -> Option<&str> {
+        let entry = self.get(path)?;
+        (entry.kind != TreeKind::Submodule).then_some(entry.object.as_str())
     }
 
     /// The id of the tree the index was listed from, if known.
@@ -281,6 +287,13 @@ fn decode_digest(value: &str) -> Result<DigestBytes> {
 #[serde(rename_all = "camelCase")]
 pub struct PartialRecipes {
     pub version: u32,
+    /// The explicit hash options used to record these recipes, checked before offline reuse.
+    #[serde(default)]
+    pub configuration_fingerprint: String,
+    /// Whether generation bound implementations to typed readers. An offline derivation
+    /// evaluates this previously observed graph without starting Bazel to renegotiate it.
+    #[serde(default)]
+    pub direct_toolchain_inputs: bool,
     /// Hex digest of the `--seed-filepaths` contents.
     pub seed_hash: String,
     /// Whether packages seed their source files with the `.bzl` files they load (the default
@@ -729,14 +742,18 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         .map(|(label, hash)| (label.clone(), hash.kind.clone()))
         .collect();
     let hashes = evaluate(recipes, &targets, tree)?;
-    Ok(HashFileData {
+    let mut result = HashFileData {
         hashes,
+        registration_impacts: base.registration_impacts.clone(),
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
         partial: base.partial.clone(),
         tree: tree.id().map(str::to_owned),
-    })
+    };
+    // The stored flat edges already include the report-only union.
+    crate::hash::apply_registration_impacts(&mut result, false)?;
+    Ok(result)
 }
 
 /// Rejects hashing options partial-graph mode cannot honour. The derivation evaluates recipes
@@ -1478,6 +1495,7 @@ mod tests {
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),
+            registration_impacts: BTreeMap::new(),
             partial: Some(recipes),
             tree: None,
         };

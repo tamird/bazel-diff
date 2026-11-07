@@ -1,0 +1,8 @@
+module(name = "sdk")
+
+bazel_dep(name = "assets")
+
+tools = use_extension("//:tools.bzl", "tools")
+use_repo(tools, "sdk_registration")
+
+register_toolchains("@sdk_registration//:registered")

@@ -1,0 +1,16 @@
+module(name = "cross_extension_test")
+
+bazel_dep(name = "assets")
+local_path_override(
+    module_name = "assets",
+    path = "assets",
+)
+
+bazel_dep(name = "sdk")
+local_path_override(
+    module_name = "sdk",
+    path = "sdk",
+)
+
+values = use_extension("@assets//:values.bzl", "values")
+values.versions(file = "//:versions.json")

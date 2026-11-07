@@ -6,7 +6,7 @@ use bazel_diff::git::{self, DerivationPolicy, Git};
 use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
     dep_edges_from_slice, filter_and_sort_labels, impacted_targets,
-    impacted_targets_with_distances, HashFileData,
+    impacted_targets_with_distances, HashFileData, ImpactEdges,
 };
 use bazel_diff::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use bazel_diff::partial::{self, Classification, Glob};
@@ -767,6 +767,9 @@ fn fingerprint_flags(
     {
         flags.insert("fineAliasInputs".into(), "2".into());
     }
+    if !args.use_cquery {
+        flags.insert("staticToolchainInputs".into(), "8".into());
+    }
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());
     }
@@ -896,6 +899,15 @@ fn partial_graph_hashes(
                     recipes.version,
                     partial::RECIPE_VERSION
                 ),
+                (Some(recipes), _)
+                    if recipes.configuration_fingerprint
+                        != bazel_diff::cache::configuration_fingerprint(options, false, true) =>
+                {
+                    format!(
+                        "{} was generated with different hashing options",
+                        path.display()
+                    )
+                }
                 (_, _)
                     if args.dep_edges_file.is_some()
                         && base.dep_edges.is_empty()
@@ -945,7 +957,6 @@ fn partial_graph_hashes(
         None => "no --baseHashes to derive from".to_owned(),
     };
     eprintln!("[Info] partial graph: full generation for {tree_id}: {fallback}");
-    options.content_hashes = Some(tree.content_hashes());
     options.partial_tree = Some(Arc::new(tree));
     generate(options)
 }
@@ -965,6 +976,11 @@ fn ensure_same_mode(from: &HashFileData, to: &HashFileData) -> Result<()> {
                 from.version,
                 to.version
             );
+        }
+        if from.configuration_fingerprint != to.configuration_fingerprint
+            || from.direct_toolchain_inputs != to.direct_toolchain_inputs
+        {
+            bail!("the starting and final partial graphs use different hashing options or toolchain graph modes");
         }
     }
     Ok(())
@@ -1022,7 +1038,7 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
         serde_json::to_string(&impacted_targets_with_distances(
             &distance_from,
             &to.hashes,
-            &dep_edges,
+            ImpactEdges::between(&dep_edges, &from, &to),
             target_types.as_ref(),
             exclude_external,
         )?)?
@@ -1061,7 +1077,13 @@ fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
         max_depth: usize::try_from(args.max_depth).ok(),
         max_roots: args.max_root_causes,
     };
-    let outcome = explain::explain(&from.hashes, &to.hashes, &dep_edges, &args.target, limits)?;
+    let outcome = explain::explain(
+        &from.hashes,
+        &to.hashes,
+        ImpactEdges::between(&dep_edges, &from, &to),
+        &args.target,
+        limits,
+    )?;
     for warning in &outcome.warnings {
         eprintln!("[Warning] {warning}");
     }
@@ -2588,8 +2610,12 @@ mod tests {
     fn partial_base(repo: &Path, path: &Path) -> HashFileData {
         let git = Git::new("git", repo);
         let tree = git.snapshot_working_tree(&[]).unwrap();
+        let options = hash_options(&hashing_args(repo), None, None, false, false).unwrap();
         let recipes = bazel_diff::partial::PartialRecipes {
             version: bazel_diff::partial::RECIPE_VERSION,
+            configuration_fingerprint: bazel_diff::cache::configuration_fingerprint(
+                &options, false, true,
+            ),
             seed_hash: "00".repeat(32),
             package_seeds: true,
             ..Default::default()
@@ -2735,9 +2761,10 @@ mod tests {
             generated.set(true);
             let tree = options.partial_tree.as_ref().expect("tree for generation");
             assert!(tree.get("BUILD").is_some());
+            assert!(options.content_hashes.is_none());
             assert_eq!(
-                options.content_hashes.as_ref().unwrap()["file.txt"],
-                tree.content_hashes()["file.txt"]
+                tree.content_hash("file.txt"),
+                Some(tree.get("file.txt").unwrap().object.as_str())
             );
             Ok(HashFileData {
                 tree: tree.id().map(str::to_owned),
@@ -2767,6 +2794,18 @@ mod tests {
         fs::write(
             &base_path,
             serde_json::to_vec(&outdated.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(counted(&args), 1);
+        let mut different_options = base.clone();
+        different_options
+            .partial
+            .as_mut()
+            .unwrap()
+            .configuration_fingerprint = "different".into();
+        fs::write(
+            &base_path,
+            serde_json::to_vec(&different_options.serialized(true, false)).unwrap(),
         )
         .unwrap();
         assert_eq!(counted(&args), 1);
@@ -2878,5 +2917,15 @@ mod tests {
         older.partial.as_mut().unwrap().version = bazel_diff::partial::RECIPE_VERSION - 1;
         let error = ensure_same_mode(&older, &partial).unwrap_err().to_string();
         assert!(error.contains("recipe versions"), "{error}");
+
+        let mut declared = partial.clone();
+        declared.partial.as_mut().unwrap().direct_toolchain_inputs = true;
+        let error = ensure_same_mode(&declared, &partial)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("different hashing options or toolchain graph modes"),
+            "{error}"
+        );
     }
 }

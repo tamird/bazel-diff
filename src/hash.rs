@@ -1,10 +1,11 @@
 use crate::bazel::{
-    encode_configured_input, split_configured, target_label, BazelOptions, QueriedTargets,
-    RepositoryInputGroup, RepositoryInputs, ScopedSources,
+    canonical_query_label, encode_configured_input, is_condition_class, split_configured,
+    target_label, BazelOptions, QueriedTargets, RepositoryInputGroup, RepositoryInputs,
+    ScopedSources, StaticToolchains,
 };
 use crate::cancel::{self, Cancellation};
 use crate::components::{component_digest, member_digest, Completion, Components, Visit};
-use crate::model::{HashFileData, TargetHash};
+use crate::model::{HashFileData, RegistrationImpact, TargetHash};
 use crate::partial::{self, RecipeRecorder, RuleRecipe, TreeIndex};
 use crate::proto::blaze_query::{target, Rule, Target};
 use anyhow::{anyhow, bail, Context, Result};
@@ -199,6 +200,13 @@ fn elapsed_millis(started: Instant) -> u64 {
     started.elapsed().as_millis() as u64
 }
 
+#[derive(Default)]
+struct ModuleRead {
+    graph_json: Option<String>,
+    static_toolchains: Option<StaticToolchains>,
+    direct_toolchain_inputs: bool,
+}
+
 pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
     generate_hashes_timed(options).map(|(data, _)| data)
 }
@@ -213,38 +221,54 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     }
     let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
+    let mut native_definitions = Vec::new();
+    let mut native_ignored = options.ignored_attributes.clone();
+    native_ignored.insert("$internal_attr_hash".to_owned());
+    let mut record_native = |name: &str, rule: &Rule| {
+        native_definitions.push((
+            name.to_owned(),
+            rule_definition_digest(rule, &native_ignored),
+        ));
+    };
     let query_started = Instant::now();
     let QueriedTargets {
+        direct_toolchain_inputs,
         targets,
         module_graph_json,
         root_mapping,
+        static_toolchains,
         scoped_sources,
         output_base,
-    } = options.bazel.query_all_targets_with(|batch, inputs| {
-        let prehash = |target: &mut Target, shared_inputs| {
-            let rule = target.rule.as_option_mut()?;
-            // Read before `prehash_rule` drops the attributes they come from.
-            let loading_inputs = partial_loading_inputs(options, rule);
-            Some((
-                rule.name.clone(),
-                PreparedRule {
-                    definition_digest: prehash_rule(rule, &options.ignored_attributes),
-                    shared_inputs,
-                    loading_inputs,
-                },
-            ))
-        };
-        if let [target] = batch {
-            definition_digests.extend(prehash(target, inputs));
-        } else {
-            // Keep query order for duplicate names, even when the hashes complete out of order.
-            batch
-                .par_iter_mut()
-                .map(|target| prehash(target, inputs.clone()))
-                .collect_into_vec(&mut digests);
-            definition_digests.extend(digests.drain(..).flatten());
-        }
-    })?;
+    } = options.bazel.query_all_targets_with(
+        |batch, inputs| {
+            let prehash = |target: &mut Target, shared_inputs| {
+                let rule = target.rule.as_option_mut()?;
+                // Read before `prehash_rule` drops the attributes they come from.
+                let loading_inputs = partial_loading_inputs(options, rule);
+                Some((
+                    rule.name.clone(),
+                    PreparedRule {
+                        definition_digest: prehash_rule(rule, &options.ignored_attributes),
+                        shared_inputs,
+                        loading_inputs,
+                    },
+                ))
+            };
+            if let [target] = batch {
+                definition_digests.extend(prehash(target, inputs));
+            } else {
+                // Keep query order for duplicate names, even when the hashes complete out of order.
+                batch
+                    .par_iter_mut()
+                    .map(|target| prehash(target, inputs.clone()))
+                    .collect_into_vec(&mut digests);
+                definition_digests.extend(digests.drain(..).flatten());
+            }
+        },
+        (options.content_hashes.is_none() && options.modified_filepaths.is_empty())
+            .then_some(&mut record_native as &mut dyn FnMut(&str, &Rule)),
+    )?;
+    definition_digests.native_definitions = native_definitions;
     let bazel_query_millis = elapsed_millis(query_started);
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
@@ -253,7 +277,11 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         options,
         targets,
         definition_digests,
-        module_graph_json,
+        ModuleRead {
+            graph_json: module_graph_json,
+            static_toolchains,
+            direct_toolchain_inputs,
+        },
         root_mapping,
         scoped_sources,
         output_base,
@@ -262,13 +290,14 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     Ok((data, timings))
 }
 
-pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
+#[cfg(test)]
+pub(crate) fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
     options.bazel.check_raw_targets_supported()?;
     hash_targets_with_digests(
         options,
         targets,
         PreparedRules::default(),
-        None,
+        ModuleRead::default(),
         None,
         ScopedSources::default(),
         None,
@@ -280,7 +309,7 @@ fn hash_targets_with_digests(
     options: &HashOptions,
     targets: Vec<Target>,
     definition_digests: PreparedRules,
-    module_graph_json: Option<String>,
+    module_read: ModuleRead,
     root_mapping: Option<Vec<u8>>,
     scoped_sources: ScopedSources,
     output_base: Option<PathBuf>,
@@ -289,17 +318,27 @@ fn hash_targets_with_digests(
     let mut external_resolver =
         ExternalRepoResolver::new(&options.bazel, root_mapping, output_base)?;
     external_resolver.scoped_sources = scoped_sources;
+    let static_toolchains = module_read.static_toolchains;
     let module_graph_started = Instant::now();
-    let module_graph_json = module_graph_json.or_else(|| options.bazel.module_graph_json());
+    let module_graph_json = module_read
+        .graph_json
+        .or_else(|| options.bazel.module_graph_json());
     options.bazel.check_cancelled()?;
     let module_graph_millis = elapsed_millis(module_graph_started);
-    let data = hash_targets_with_environment(
+    let direct_toolchain_inputs = module_read.direct_toolchain_inputs;
+    let mut data = hash_targets_with_environment(
         options,
         targets,
         definition_digests,
         external_resolver,
         module_graph_json,
+        static_toolchains,
     )?;
+    if let Some(recipes) = &mut data.partial {
+        recipes.configuration_fingerprint =
+            crate::cache::configuration_fingerprint(options, false, true);
+        recipes.direct_toolchain_inputs = direct_toolchain_inputs;
+    }
     let timings = GenerationTimings {
         bazel_query_millis: 0,
         module_graph_millis,
@@ -308,12 +347,27 @@ fn hash_targets_with_digests(
     Ok((data, timings))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputCoverage {
+    Conservative,
+    Ordinary,
+    Typed,
+}
+
+/// Source and query modes whose named inputs can use fresh acquisition evidence.
+fn can_use_observed_inputs(options: &HashOptions) -> bool {
+    options.bazel.can_use_observed_inputs()
+        && options.content_hashes.is_none()
+        && options.modified_filepaths.is_empty()
+}
+
 fn hash_targets_with_environment(
     options: &HashOptions,
     targets: Vec<Target>,
     definition_digests: PreparedRules,
     external_resolver: ExternalRepoResolver,
     module_graph_json: Option<String>,
+    static_toolchains: Option<StaticToolchains>,
 ) -> Result<HashFileData> {
     if options.partial_tree.is_some() && options.bazel.use_cquery {
         bail!("partial graph mode does not support --useCquery");
@@ -338,10 +392,27 @@ fn hash_targets_with_environment(
             .collect(),
         external_resolver,
     };
+    let fallbacks =
+        crate::bazel::repository_fallbacks(&targets, &options.bazel.fine_grained_external_repos);
+    let has_fallbacks = !fallbacks.is_empty();
+    let input_coverage = if !has_fallbacks
+        || source_hasher
+            .external_resolver
+            .scoped_sources
+            .supplier_reads
+            .is_none()
+        || !can_use_observed_inputs(options)
+    {
+        InputCoverage::Conservative
+    } else if static_toolchains.is_some() {
+        InputCoverage::Typed
+    } else {
+        InputCoverage::Ordinary
+    };
+    let use_observed_inputs = input_coverage != InputCoverage::Conservative;
     if !options.bazel.use_cquery
         && options.bazel.isolated_dependency_root.is_none()
-        && !options.bazel.fine_grained_external_repos.is_empty()
-        && options.partial_tree.is_none()
+        && (!options.bazel.fine_grained_external_repos.is_empty() || has_fallbacks)
         && options.content_hashes.is_none()
         && options.modified_filepaths.is_empty()
     {
@@ -379,6 +450,7 @@ fn hash_targets_with_environment(
     let PreparedRules {
         mut ids,
         mut prepared,
+        native_definitions,
     } = definition_digests;
     ids.reserve(targets.len().saturating_sub(ids.len()));
     let mut slots = Vec::with_capacity(targets.len());
@@ -448,8 +520,17 @@ fn hash_targets_with_environment(
         // is what evaluation computes anyway, so it is left out.
         let unresolved: DigestBytes = Sha256::digest([]).into();
         for (label, digest) in &physical {
-            if !is_main_repo(label) && *digest != unresolved {
-                recorder.record_external_source(label, *digest);
+            if !is_main_repo(label) {
+                if *digest == unresolved {
+                    // Supplier subscriptions may use only an input the recipe saved.
+                    source_hasher
+                        .external_resolver
+                        .scoped_sources
+                        .queried_files
+                        .remove(label);
+                } else {
+                    recorder.record_external_source(label, *digest);
+                }
             }
         }
     }
@@ -546,6 +627,124 @@ fn hash_targets_with_environment(
             .prepared
             .definition_digest = digest.finalize().into();
     }
+    if !fallbacks.is_empty() && !use_observed_inputs {
+        // Apply conservative scopes to the original ordinary inputs before
+        // adding typed supplier edges.
+        for slot in &mut rules.slots {
+            let Some(node) = slot.rule.as_mut() else {
+                continue;
+            };
+            let node = Rc::get_mut(node).expect("unique ordinary input owner");
+            if node.rule.name.starts_with("//external:") {
+                continue;
+            }
+            let scopes = node
+                .rule
+                .rule_input
+                .iter()
+                .filter_map(|input| crate::bazel::repository_fallback(input, &fallbacks))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            node.rule.rule_input.extend(scopes);
+        }
+    }
+    let mut static_changes = match static_toolchains.as_ref() {
+        Some(metadata) => add_static_toolchain_inputs(
+            &mut rules,
+            &hash_targets,
+            metadata,
+            source_hasher.external_resolver.repo_mapping(),
+            &options.ignored_attributes,
+        ),
+        None => StaticToolchainChanges::default(),
+    };
+    if let Some(reads) = source_hasher
+        .external_resolver
+        .scoped_sources
+        .supplier_reads
+        .as_ref()
+        .filter(|reads| {
+            use_observed_inputs
+                || !reads.incomplete.is_empty()
+                || !reads.untyped_leaves.is_empty()
+                || !reads.uncertain_class_repositories.is_empty()
+        })
+    {
+        subscribe_to_unresolved_inputs(
+            &mut rules,
+            &hash_targets,
+            &source_hasher,
+            &mut static_changes.derived_inputs,
+            &fallbacks,
+            reads,
+            input_coverage,
+        )?;
+    }
+    for (id, digest) in static_changes.digests {
+        rules.slots[id]
+            .rule
+            .as_mut()
+            .and_then(Rc::get_mut)
+            .expect("unique toolchain input owner")
+            .prepared
+            .definition_digest = digest;
+    }
+    for (name, definition) in native_definitions {
+        let id = rules.ids[&name];
+        let node = rules.slots[id]
+            .rule
+            .as_mut()
+            .and_then(Rc::get_mut)
+            .expect("verified native rule");
+        node.prepared.definition_digest = Sha256::new()
+            .chain_update(b"bazel-diff-native-definition\0")
+            .chain_update(node.prepared.definition_digest)
+            .chain_update(definition)
+            .finalize()
+            .into();
+    }
+    let mut derived_inputs = static_changes.derived_inputs;
+    if !derived_inputs.is_empty() {
+        let fine = &options.bazel.fine_grained_external_repos;
+        let mapping = source_hasher.external_resolver.canonical_repo_nodes();
+        for (reader, implied) in &mut derived_inputs {
+            let Some(node) = rules.get(reader).and_then(|slot| slot.rule.as_ref()) else {
+                continue;
+            };
+            let mut companions: BTreeSet<_> = implied
+                .iter()
+                .filter_map(
+                    |input| match transform_external_input(input, fine, mapping) {
+                        Cow::Owned(repo) => Some(repo),
+                        Cow::Borrowed(_) => None,
+                    },
+                )
+                .collect();
+            if companions.is_empty()
+                && !implied.iter().any(|input| input.starts_with("//external:"))
+            {
+                continue;
+            }
+            let mut ordinary_companions = Vec::new();
+            for input in node
+                .rule
+                .rule_input
+                .iter()
+                .filter(|label| !implied.contains(*label))
+            {
+                companions.remove(input);
+                let companion = transform_external_input(input, fine, mapping);
+                companions.remove(companion.as_ref());
+                if implied.contains(companion.as_ref()) {
+                    ordinary_companions.push(companion.into_owned());
+                }
+            }
+            implied.extend(companions);
+            for repo in ordinary_companions {
+                implied.remove(&repo);
+            }
+        }
+    }
     // An already captured mapping can be reused without a new Bazel call.
     // Configured inputs retain their on-demand lookup.
     if !options.bazel.use_cquery && source_hasher.external_resolver.repo_mapping.get().is_some() {
@@ -611,6 +810,7 @@ fn hash_targets_with_environment(
         ));
     }
     let mut context = HashContext {
+        derived_inputs: &derived_inputs,
         options,
         source_hasher: &source_hasher,
         source_digests,
@@ -685,17 +885,58 @@ fn hash_targets_with_environment(
         hashes = partial::evaluate(&recipes, &targets, tree)?;
         partial = Some(recipes);
     }
-    Ok(HashFileData {
+    let mut data = HashFileData {
         hashes,
         module_graph_json,
         dependency_fingerprint: None,
         dep_edges,
+        registration_impacts: static_changes.registration_impacts,
         partial,
         tree: options
             .partial_tree
             .as_ref()
             .and_then(|tree| tree.id().map(str::to_owned)),
-    })
+    };
+    apply_registration_impacts(&mut data, options.track_deps)?;
+    Ok(data)
+}
+
+/// Project implementation content into the public declaration only after every
+/// ordinary target, including other declarations, has its structural hash.
+pub(crate) fn apply_registration_impacts(data: &mut HashFileData, track_deps: bool) -> Result<()> {
+    let mut results = Vec::with_capacity(data.registration_impacts.len());
+    for (label, report) in &mut data.registration_impacts {
+        let declaration = data.hashes.get(label).with_context(|| {
+            format!("reported toolchain declaration {label} has no target hash")
+        })?;
+        report.declaration_hash = declaration.hash.to_string();
+        let mut digest = Sha256::new();
+        digest.update(b"bazel-diff-toolchain-report\0");
+        digest.update(report.declaration_hash.as_bytes());
+        for body in &report.implementation_edges {
+            let target = data
+                .hashes
+                .get(body)
+                .with_context(|| format!("implementation {body} of {label} has no target hash"))?;
+            digest.update((body.len() as u64).to_be_bytes());
+            digest.update(body.as_bytes());
+            digest.update(target.hash.to_string().as_bytes());
+        }
+        results.push((label, DigestBytes::from(digest.finalize())));
+        if track_deps {
+            let edges = data.dep_edges.entry(label.clone()).or_default();
+            edges.extend(report.implementation_edges.iter().cloned());
+            edges.sort_unstable();
+            edges.dedup();
+        }
+    }
+    for (label, digest) in results {
+        data.hashes
+            .get_mut(label)
+            .expect("validated declaration")
+            .hash = digest.into();
+    }
+    Ok(())
 }
 
 /// Groups the keys that carry a configuration checksum by label, each group sorted.
@@ -823,6 +1064,7 @@ fn label_hash(
 struct PreparedRules {
     ids: HashMap<String, usize>,
     prepared: Vec<Option<PreparedRule>>,
+    native_definitions: Vec<(String, DigestBytes)>,
 }
 
 impl Extend<(String, PreparedRule)> for PreparedRules {
@@ -842,6 +1084,751 @@ impl Extend<(String, PreparedRule)> for PreparedRules {
 struct Labels {
     ids: HashMap<String, usize>,
     slots: Vec<LabelSlot>,
+}
+
+/// Charge a missing input to the repository that supplies it. A returned rule
+/// accounts for its own inputs, including its own unresolved boundaries.
+fn subscribe_to_unresolved_inputs(
+    rules: &mut Labels,
+    targets: &[HashTarget],
+    hasher: &SourceHasher<'_>,
+    derived_inputs: &mut HashMap<String, BTreeSet<String>>,
+    fallbacks: &HashMap<String, String>,
+    reads: &crate::bazel::SupplierReads,
+    coverage: InputCoverage,
+) -> Result<()> {
+    let precise = coverage != InputCoverage::Conservative;
+    let mapping = hasher.external_resolver.repo_mapping();
+    let canonical_nodes = hasher.external_resolver.canonical_repo_nodes();
+    let canonical = |label: &str| crate::bazel::canonical_query_label(label, mapping).into_owned();
+    let mut represented = HashSet::new();
+    if precise {
+        let represented_rule = |label: &str, key: &str| {
+            if reads.incomplete.contains(key) || reads.untyped_leaves.contains(key) {
+                return false;
+            }
+            rules
+                .get(label)
+                .and_then(|slot| slot.rule.as_ref())
+                .is_some_and(|node| {
+                    let rule = &node.rule;
+                    let native = reads.verified_native.contains(key)
+                        || rule.rule_class_key.as_deref().is_some_and(|class| {
+                            class == rule.rule_class
+                                && (matches!(
+                                    class,
+                                    "alias"
+                                        | "filegroup"
+                                        | "toolchain"
+                                        | "toolchain_type"
+                                        | "package_group"
+                                ) || is_condition_class(class))
+                        });
+                    // Without declared reader roles, a type reference can be an
+                    // implicit toolchain requirement. Keep its supplier scope.
+                    if coverage == InputCoverage::Ordinary
+                        && native
+                        && rule.rule_class == "toolchain_type"
+                    {
+                        return false;
+                    }
+                    (coverage == InputCoverage::Typed
+                        && rule.possible_toolchain_types.as_option().is_some())
+                        || native
+                })
+        };
+        for target in targets {
+            let label = target.label();
+            if is_main_repo(label) {
+                continue;
+            }
+            let key = canonical(label);
+            let covered = match target {
+                HashTarget::Rule(_) => represented_rule(label, &key),
+                HashTarget::Generated {
+                    generating_rule, ..
+                } => represented_rule(generating_rule, &canonical(generating_rule)),
+                HashTarget::Source(_) => {
+                    hasher.resolve(label, false)?.is_some_and(|(path, key, _)| {
+                        let saved = hasher.tree.is_none()
+                            || (hasher
+                                .external_resolver
+                                .scoped_sources
+                                .queried_files
+                                .contains(label)
+                                && hasher.content_hash(&key).is_none());
+                        saved && hasher.workspace.join(path).is_file()
+                    })
+                }
+            };
+            if covered && !reads.incomplete.contains(&key) && !reads.untyped_leaves.contains(&key) {
+                represented.insert(key);
+                represented.insert(label.to_owned());
+            }
+        }
+    }
+    // Keep uncertainty where the query model placed the original input. In particular,
+    // reading a toolchain declaration and using its implementation are different edges.
+    let mut subscribers = HashMap::<String, BTreeSet<(usize, bool)>>::new();
+    let mut add = BTreeMap::<usize, BTreeMap<String, bool>>::new();
+    let mut subscribe = |reader, scope, derived| {
+        add.entry(reader)
+            .or_default()
+            .entry(scope)
+            .and_modify(|only| *only &= derived)
+            .or_insert(derived);
+    };
+    let mut subscribe_repository =
+        |reader: usize, own: Option<&String>, repository: Option<&str>, derived: bool| {
+            if let Some(scope) = own {
+                subscribe(reader, scope.clone(), derived);
+            }
+            let Some(repository) = repository.filter(|name| !name.is_empty()) else {
+                return;
+            };
+            let name = canonical_nodes
+                .get(repository)
+                .map_or(repository, String::as_str);
+            let repository_node = format!("//external:{name}");
+            if derived
+                && rules
+                    .get(&repository_node)
+                    .is_some_and(|slot| slot.rule.is_some())
+            {
+                subscribe(reader, repository_node.clone(), true);
+            }
+            // A visible hub may also be a direct member of another conservative scope.
+            subscribers
+                .entry(repository_node)
+                .or_default()
+                .insert((reader, derived));
+        };
+    for (reader, slot) in rules.slots.iter().enumerate() {
+        let Some(node) = &slot.rule else { continue };
+        let label = &node.rule.name;
+        if label.starts_with("//external:") {
+            continue;
+        }
+        let implied = derived_inputs.get(label);
+        let owner = canonical(label);
+        let unrecorded = reads.unrecorded_definitions.contains(&owner);
+        let deferred = reads.deferred_bindings.get(&owner);
+        let inputs = node
+            .rule
+            .rule_input
+            .iter()
+            .map(|v| (v, implied.is_some_and(|set| set.contains(v)), false))
+            .chain(deferred.into_iter().flatten().map(|v| (v, false, true)));
+        for (input, resolution_input, uncertain_binding) in inputs {
+            if is_main_repo(input) {
+                continue;
+            }
+            if represented.contains(input) && !unrecorded {
+                continue;
+            }
+            let key = canonical(input);
+            if !precise
+                && !uncertain_binding
+                && !reads.incomplete.contains(&key)
+                && !reads.untyped_leaves.contains(&key)
+            {
+                continue;
+            }
+            if represented.contains(&key) && !unrecorded {
+                continue;
+            }
+            let own = crate::bazel::repository_fallback(input, fallbacks)
+                .or_else(|| crate::bazel::repository_fallback(&key, fallbacks));
+            let repository = key
+                .strip_prefix("@@")
+                .and_then(|s| s.split_once("//"))
+                .map(|(repo, _)| repo);
+            subscribe_repository(reader, own, repository, resolution_input);
+        }
+        if let Some(repositories) = reads.uncertain_class_repositories.get(label) {
+            for repository in repositories {
+                let own = fallbacks.get(&format!("@@{repository}"));
+                subscribe_repository(reader, own, Some(repository), true);
+            }
+        }
+    }
+    // A hidden member may have no public fallback of its own. Find its actual
+    // containing scope among the emitted direct members; membership of another
+    // fallback is not ownership. Shared inputs are stored out-of-line.
+    let eligible: HashSet<_> = fallbacks.values().map(String::as_str).collect();
+    for (_, slot) in rules.iter() {
+        let Some(node) = &slot.rule else { continue };
+        let scope = &node.rule.name;
+        if !eligible.contains(scope.as_str()) {
+            continue;
+        }
+        let shared = node
+            .prepared
+            .shared_inputs
+            .iter()
+            .flat_map(|group| &group.labels);
+        for member in node.rule.rule_input.iter().chain(shared) {
+            if let Some(readers) = subscribers.get(member) {
+                for &(reader, derived) in readers {
+                    subscribe(reader, scope.clone(), derived);
+                }
+            }
+        }
+    }
+    for (reader, scopes) in add {
+        let node = rules.slots[reader]
+            .rule
+            .as_mut()
+            .and_then(Rc::get_mut)
+            .expect("unique supplier input owner");
+        // An independently declared label still contributes to the direct hash.
+        let mut implied = scopes
+            .iter()
+            .filter(|&(scope, derived)| *derived && !node.rule.rule_input.contains(scope))
+            .map(|(scope, _)| scope.clone())
+            .peekable();
+        if implied.peek().is_some() {
+            derived_inputs
+                .entry(node.rule.name.clone())
+                .or_default()
+                .extend(implied);
+        }
+        node.rule.rule_input.extend(scopes.into_keys());
+        node.rule.rule_input.sort_unstable();
+        node.rule.rule_input.dedup();
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StaticToolchainChanges {
+    registration_impacts: BTreeMap<String, RegistrationImpact>,
+    digests: Vec<(usize, DigestBytes)>,
+    /// Resolution and fallback inputs added to a reader. Their contents are
+    /// transitive; the declaration owns the implementation and matcher bindings.
+    derived_inputs: HashMap<String, BTreeSet<String>>,
+}
+
+/// Add observed registration paths to positively typed readers. Structural
+/// bindings and registration order contribute to their own direct definitions.
+fn add_static_toolchain_inputs(
+    rules: &mut Labels,
+    targets: &[HashTarget],
+    metadata: &StaticToolchains,
+    mapping: &HashMap<String, String>,
+    ignored: &HashSet<String>,
+) -> StaticToolchainChanges {
+    let mut needed = BTreeSet::new();
+    for (alias, destinations) in metadata
+        .aliases
+        .iter()
+        .chain(&metadata.local_registration_aliases)
+    {
+        needed.insert(alias.as_str());
+        needed.extend(destinations.iter().map(String::as_str));
+    }
+    for (declaration, binding) in &metadata.declarations {
+        needed.insert(declaration.as_str());
+        needed.extend(binding.implementations.iter().map(String::as_str));
+    }
+    needed.extend(
+        metadata
+            .nodep_settings
+            .values()
+            .flatten()
+            .map(String::as_str),
+    );
+    needed.extend(metadata.by_type.values().flatten().map(String::as_str));
+    let mut apparent = HashMap::<&str, Vec<&str>>::new();
+    for (name, canonical) in mapping {
+        apparent
+            .entry(canonical.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
+    let spellings_for = |label: &str| {
+        let mut spellings = vec![label.to_owned()];
+        if label.starts_with("//") {
+            spellings.push(format!("@{label}"));
+            spellings.push(format!("@@{label}"));
+        } else if let Some((repository, target)) = label
+            .strip_prefix("@@")
+            .and_then(|label| label.split_once("//"))
+        {
+            spellings.extend(
+                apparent
+                    .get(repository)
+                    .into_iter()
+                    .flatten()
+                    .map(|name| format!("@{name}//{target}")),
+            );
+        }
+        spellings
+    };
+    let observed_name = |label: &str| {
+        spellings_for(label)
+            .into_iter()
+            .filter(|name| {
+                rules
+                    .ids
+                    .get(name)
+                    .is_some_and(|id| rules.slots[*id].rule.is_some())
+            })
+            .min()
+    };
+    let mut observed = HashMap::new();
+    for label in needed {
+        if let Some(name) = observed_name(label) {
+            observed.insert(label, name);
+        }
+    }
+    // A declaration reports changes to each returned implementation. Only the
+    // structural declaration is an input to a rule that merely names it.
+    let unresolved_bodies: HashSet<_> = metadata
+        .declarations
+        .values()
+        .flat_map(|binding| &binding.implementations)
+        .map(String::as_str)
+        .filter(|body| !observed.contains_key(body))
+        .collect();
+    let mut non_rule_bodies = HashMap::new();
+    if !unresolved_bodies.is_empty() {
+        for target in targets
+            .iter()
+            .filter(|target| !matches!(target, HashTarget::Rule(_)))
+        {
+            let name = target.label();
+            let canonical = canonical_query_label(name, mapping);
+            if unresolved_bodies.contains(canonical.as_ref()) {
+                non_rule_bodies
+                    .entry(canonical.into_owned())
+                    .and_modify(|old: &mut &str| *old = (*old).min(name))
+                    .or_insert(name);
+            }
+        }
+    }
+    let mut registration_impacts = BTreeMap::new();
+    for (declaration, binding) in &metadata.declarations {
+        let Some(name) = observed.get(declaration.as_str()) else {
+            continue;
+        };
+        let mut implementation_edges: Vec<_> = binding
+            .implementations
+            .iter()
+            .filter(|body| !binding.ordinary_inputs.contains(*body))
+            .filter_map(|body| {
+                observed
+                    .get(body.as_str())
+                    .map(String::as_str)
+                    .or_else(|| non_rule_bodies.get(body).copied())
+            })
+            .filter(|body| *body != name)
+            .map(str::to_owned)
+            .collect();
+        implementation_edges.sort_unstable();
+        implementation_edges.dedup();
+        if !implementation_edges.is_empty() {
+            registration_impacts.insert(
+                name.clone(),
+                RegistrationImpact {
+                    declaration_hash: String::new(),
+                    implementation_edges,
+                },
+            );
+        }
+    }
+    let mut inputs = HashMap::<String, BTreeSet<String>>::new();
+    fn add_inputs<'a>(
+        inputs: &mut HashMap<String, BTreeSet<String>>,
+        observed: &HashMap<&str, String>,
+        source: &str,
+        destinations: impl Iterator<Item = &'a String>,
+    ) {
+        let Some(name) = observed.get(source) else {
+            return;
+        };
+        inputs
+            .entry(name.clone())
+            .or_default()
+            .extend(destinations.map(|destination| {
+                observed
+                    .get(destination.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| destination.clone())
+            }));
+    }
+    for (alias, destinations) in &metadata.aliases {
+        add_inputs(&mut inputs, &observed, alias, destinations.iter());
+    }
+    // Implementations and NODEP matcher content are inputs to toolchain
+    // resolution. An ordinary referrer reads the declaration's bindings.
+    let mut module_declarations = HashSet::new();
+    let mut resolution_by_type = HashMap::new();
+    for (ty, registrations) in &metadata.by_type {
+        let mut resolution = BTreeSet::new();
+        for registration in registrations {
+            if let Some(path) = metadata.registration_path_for(ty, registration) {
+                for declaration in &path.declarations {
+                    if let Some(binding) = metadata.declarations.get(declaration) {
+                        module_declarations.insert(declaration.clone());
+                        resolution.extend(&binding.implementations);
+                        resolution.extend(
+                            metadata
+                                .nodep_settings
+                                .get(declaration)
+                                .into_iter()
+                                .flatten(),
+                        );
+                    }
+                }
+            }
+        }
+        resolution_by_type.insert(ty.as_str(), resolution);
+    }
+    let bindings: HashMap<_, _> = metadata
+        .bindings
+        .iter()
+        .filter_map(|(label, contributions)| {
+            observed
+                .get(label.as_str())
+                .map(|name| (name.as_str(), contributions))
+        })
+        .collect();
+    let observed_ids: HashMap<_, _> = observed
+        .iter()
+        .filter_map(|(canonical, name)| rules.ids.get(name).map(|id| (*canonical, *id)))
+        .collect();
+    let mut type_keys = HashMap::new();
+    for ty in metadata
+        .by_type
+        .keys()
+        .chain(metadata.declarations.values().map(|row| &row.ty))
+    {
+        type_keys
+            .entry(ty.as_str())
+            .or_insert_with(|| metadata.possible_type_keys(ty));
+    }
+    // Only native declarations already in the ordinary graph can introduce
+    // a local registration. A verified native alias can forward that input.
+    let declarations: HashMap<_, _> = metadata
+        .declarations
+        .keys()
+        .filter_map(|name| observed_ids.get(name.as_str()).map(|id| (*id, name)))
+        .collect();
+    let mut aliases: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (name, destinations) in metadata
+        .aliases
+        .iter()
+        .chain(&metadata.local_registration_aliases)
+    {
+        let Some(&alias) = observed_ids.get(name.as_str()) else {
+            continue;
+        };
+        for destination in destinations {
+            if let Some(&id) = observed_ids.get(destination.as_str()) {
+                aliases.entry(id).or_default().push(alias);
+            }
+        }
+    }
+    // Only an alias whose every alternative ends at a declaration can
+    // terminate the analysis walk. A mixed alias still has real child rules.
+    let barriers: HashSet<_> = metadata
+        .declaration_forwarders()
+        .iter()
+        .filter_map(|name| observed_ids.get(name.as_str()).copied())
+        .collect();
+    let unknown_aliases = reachable(
+        metadata
+            .local_registration_aliases
+            .keys()
+            .filter(|label| metadata.unresolved.contains(*label))
+            .filter_map(|label| observed_ids.get(label.as_str()).copied()),
+        &aliases,
+    );
+    let mut forwarding: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    let mut pending: Vec<_> = declarations.keys().map(|id| (*id, *id)).collect();
+    while let Some((id, declaration)) = pending.pop() {
+        if forwarding.entry(id).or_default().insert(declaration) {
+            pending.extend(
+                aliases
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .map(|alias| (*alias, declaration)),
+            );
+        }
+    }
+    let resolve_slot = |raw: &str| -> Option<usize> {
+        rules.ids.get(raw).copied().or_else(|| {
+            spellings_for(&canonical_query_label(raw, mapping))
+                .into_iter()
+                .filter(|name| rules.ids.contains_key(name))
+                .min()
+                .and_then(|name| rules.ids.get(&name).copied())
+        })
+    };
+    enum Child {
+        Rule(usize),
+        Leaf,
+        Unknown,
+    }
+    let generators = OnceCell::<HashMap<_, _>>::new();
+    let child = |input: &str| {
+        if input.starts_with("//external:")
+            || metadata
+                .non_reader_inputs
+                .contains(canonical_query_label(input, mapping).as_ref())
+        {
+            return Child::Leaf;
+        }
+        let slot = resolve_slot(input).or_else(|| {
+            let generated = generators.get_or_init(|| {
+                targets
+                    .iter()
+                    .filter_map(|target| {
+                        if let HashTarget::Generated {
+                            name,
+                            generating_rule,
+                        } = target
+                        {
+                            Some((canonical_query_label(name, mapping), generating_rule))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            generated
+                .get(&canonical_query_label(input, mapping))
+                .and_then(|name| resolve_slot(name))
+        });
+        let Some(id) = slot else {
+            return Child::Unknown;
+        };
+        if declarations.contains_key(&id)
+            || barriers.contains(&id)
+            || rules.slots[id].source.is_some()
+        {
+            return Child::Leaf;
+        }
+        match &rules.slots[id].rule {
+            Some(node) if node.rule.rule_class_key.as_deref() == Some("package_group") => {
+                Child::Leaf
+            }
+            Some(_) => Child::Rule(id),
+            None => Child::Unknown,
+        }
+    };
+    // Ordinary loading knows which declarations a rule names and which
+    // toolchain types its dependency rules may request. It does not resolve
+    // an incoming configuration. Keep this uncertainty on the referrer.
+    let mut referrers_by_declaration: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut obligations: HashMap<usize, Vec<&String>> = HashMap::new();
+    if declarations
+        .values()
+        .any(|name| !module_declarations.contains(*name))
+    {
+        for (holder, slot) in rules.slots.iter().enumerate() {
+            let Some(node) = &slot.rule else { continue };
+            if node.rule.possible_toolchain_types.as_option().is_none() {
+                continue;
+            }
+            for input in &node.rule.rule_input {
+                let Some(id) = resolve_slot(input) else {
+                    continue;
+                };
+                for &declaration in forwarding.get(&id).into_iter().flatten() {
+                    let name = declarations[&declaration];
+                    if module_declarations.contains(name) {
+                        continue;
+                    }
+                    if unknown_aliases.contains(&id) {
+                        obligations.entry(holder).or_default().push(name);
+                    } else {
+                        referrers_by_declaration
+                            .entry(declaration)
+                            .or_default()
+                            .insert(holder);
+                    }
+                }
+            }
+        }
+    }
+    fn reachable(
+        seeds: impl IntoIterator<Item = usize>,
+        graph: &HashMap<usize, Vec<usize>>,
+    ) -> HashSet<usize> {
+        let mut queue: Vec<_> = seeds.into_iter().collect();
+        let mut reached = HashSet::new();
+        while let Some(id) = queue.pop() {
+            if reached.insert(id) {
+                queue.extend(graph.get(&id).into_iter().flatten().copied());
+            }
+        }
+        reached
+    }
+    for (declaration, referrers) in referrers_by_declaration {
+        let name = declarations[&declaration];
+        let accepted_types = &type_keys[metadata.declarations[name].ty.as_str()];
+        let mut seen = HashSet::new();
+        let mut queue: Vec<_> = referrers.iter().copied().collect();
+        let mut parents: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut possible = Vec::new();
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let node = &rules.slots[id].rule.as_ref().expect("returned rule").rule;
+            if node
+                .possible_toolchain_types
+                .as_option()
+                .is_none_or(|types| {
+                    types.label.iter().any(|ty| {
+                        let ty = canonical_query_label(ty, mapping);
+                        type_keys
+                            .get(ty.as_ref())
+                            .is_some_and(|keys| !keys.is_disjoint(accepted_types))
+                    })
+                })
+            {
+                possible.push(id);
+            }
+            for input in &node.rule_input {
+                match child(input) {
+                    Child::Rule(dep) => {
+                        parents.entry(dep).or_default().push(id);
+                        queue.push(dep);
+                    }
+                    Child::Unknown => possible.push(id),
+                    Child::Leaf => {}
+                }
+            }
+        }
+        let readers = reachable(possible, &parents);
+        for holder in referrers.intersection(&readers) {
+            obligations.entry(*holder).or_default().push(name);
+        }
+    }
+    let mut digests = Vec::new();
+    let mut derived_inputs = HashMap::new();
+    for (id, slot) in rules.slots.iter_mut().enumerate() {
+        let Some(node) = slot.rule.as_mut().and_then(Rc::get_mut) else {
+            continue;
+        };
+        let mut changed_inputs = false;
+        if let Some(extra) = inputs.remove(&node.rule.name) {
+            node.rule.rule_input.extend(extra);
+            changed_inputs = true;
+        }
+        let mut seed = Sha256::new();
+        let mut has_seed = false;
+        if let Some(contributions) = bindings.get(node.rule.name.as_str()) {
+            for (attribute, digest) in contributions.iter() {
+                if ignored.contains(*attribute) {
+                    continue;
+                }
+                seed.update(b"binding\0");
+                seed.update((attribute.len() as u64).to_le_bytes());
+                seed.update(attribute.as_bytes());
+                seed.update(digest);
+                has_seed = true;
+            }
+        }
+        let declared_end = node.rule.rule_input.len();
+        let mut implied = BTreeSet::new();
+        let mut registration_inputs = Vec::new();
+        let mut suppliers = BTreeMap::<&String, bool>::new();
+        if let Some(types) = node.rule.possible_toolchain_types.as_option() {
+            let required: BTreeSet<_> = types
+                .label
+                .iter()
+                .map(|label| crate::bazel::canonical_query_label(label, mapping).into_owned())
+                .collect();
+            for ty in required {
+                let Some(registrations) = metadata.by_type.get(&ty) else {
+                    continue;
+                };
+                seed.update(b"type\0");
+                seed.update((ty.len() as u64).to_le_bytes());
+                seed.update(ty.as_bytes());
+                seed.update((registrations.len() as u64).to_le_bytes());
+                for registration in registrations {
+                    seed.update((registration.len() as u64).to_le_bytes());
+                    seed.update(registration.as_bytes());
+                }
+                let literal_registrations = registrations
+                    .iter()
+                    .filter(|registration| observed.contains_key(registration.as_str()));
+                for (target, derived) in literal_registrations.map(|target| (target, false)).chain(
+                    resolution_by_type
+                        .get(ty.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|&input| (input, true)),
+                ) {
+                    suppliers
+                        .entry(target)
+                        .and_modify(|only_derived| *only_derived &= derived)
+                        .or_insert(derived);
+                }
+                has_seed = true;
+            }
+        }
+        for declaration in obligations.get(&id).into_iter().flatten() {
+            for input in metadata.declarations[*declaration]
+                .implementations
+                .iter()
+                .chain(
+                    metadata
+                        .nodep_settings
+                        .get(*declaration)
+                        .into_iter()
+                        .flatten(),
+                )
+            {
+                suppliers.entry(input).or_insert(true);
+            }
+        }
+        for (target, derived) in suppliers {
+            let input = observed.get(target.as_str()).unwrap_or(target);
+            if derived {
+                implied.insert(input.clone());
+            } else {
+                registration_inputs.push(input);
+            }
+            node.rule.rule_input.push(input.clone());
+            changed_inputs = true;
+        }
+        if !implied.is_empty() {
+            // Preserve each independently declared spelling. A separately appended
+            // equivalent spelling remains derived.
+            for input in &node.rule.rule_input[..declared_end] {
+                implied.remove(input);
+            }
+            for input in registration_inputs {
+                implied.remove(input);
+            }
+            if !implied.is_empty() {
+                derived_inputs.insert(node.rule.name.clone(), implied);
+            }
+        }
+        if changed_inputs {
+            node.rule.rule_input.sort_unstable();
+            node.rule.rule_input.dedup();
+        }
+        if has_seed {
+            let mut digest = Sha256::new();
+            digest.update(b"bazel-diff-static-toolchains\0");
+            digest.update(node.prepared.definition_digest);
+            digest.update(seed.finalize());
+            digests.push((id, digest.finalize().into()));
+        }
+    }
+    StaticToolchainChanges {
+        registration_impacts,
+        digests,
+        derived_inputs,
+    }
 }
 
 impl Labels {
@@ -961,6 +1948,7 @@ enum Input<'a> {
 }
 
 struct HashContext<'a> {
+    derived_inputs: &'a HashMap<String, BTreeSet<String>>,
     options: &'a HashOptions,
     source_hasher: &'a SourceHasher<'a>,
     source_digests: Vec<DigestBytes>,
@@ -1132,12 +2120,15 @@ impl HashContext<'_> {
                 );
             }
         }
+        let derived_inputs = self.derived_inputs.get(canonical_key);
         for (position, encoded_input) in inputs.into_iter().enumerate() {
             let input_slot = rule
                 .input_positions
                 .as_ref()
                 .and_then(|ids| ids.get(position).copied().flatten());
-            builder.direct(encoded_input.as_bytes());
+            if derived_inputs.is_none_or(|inputs| !inputs.contains(encoded_input.as_ref())) {
+                builder.direct(encoded_input.as_bytes());
+            }
             let input_label = target_label(&encoded_input);
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
                 Some(Input::Source(digest)) => builder.source(input_label, digest),
@@ -1800,7 +2791,7 @@ fn rule_definition_digest(rule: &Rule, ignored: &HashSet<String>) -> DigestBytes
 fn prehash_rule(rule: &mut Rule, ignored: &HashSet<String>) -> DigestBytes {
     let digest = rule_definition_digest(rule, ignored);
     rule.attribute
-        .retain(|attribute| attribute.name == "tags" || attribute.name == "visibility");
+        .retain(|attribute| matches!(attribute.name.as_str(), "tags" | "visibility"));
     // `retain` keeps the buffer it was decoded into. An `Attribute` is several hundred bytes and a
     // rule carries dozens of them (every implicit attribute is in the proto), so without this each
     // queried rule pins tens of kilobytes of dead capacity until hashing ends.
@@ -1995,6 +2986,13 @@ struct SourceHasher<'a> {
 }
 
 impl SourceHasher<'_> {
+    fn content_hash(&self, key: &str) -> Option<&str> {
+        match self.content_hashes {
+            Some(overrides) => overrides.get(key).map(String::as_str),
+            None => self.tree.and_then(|tree| tree.content_hash(key)),
+        }
+    }
+
     fn digest(&self, label: &str, seed: &[u8]) -> Result<DigestBytes> {
         self.digest_source(label, seed, false)
     }
@@ -2022,10 +3020,7 @@ impl SourceHasher<'_> {
         let metadata = fs::metadata(&absolute).ok();
         let executable = metadata.as_ref().is_some_and(metadata_owner_executable);
         let mut hasher = Sha256::new();
-        if let Some(content_hash) = self
-            .content_hashes
-            .and_then(|hashes| hashes.get(&content_key))
-        {
+        if let Some(content_hash) = self.content_hash(&content_key) {
             hasher.update(content_hash.as_bytes());
             hasher.update([1]);
             hasher.update([u8::from(executable)]);
@@ -2204,7 +3199,6 @@ impl SourceHasher<'_> {
                 .contains(label);
             if (observed || (configured_source && canonical))
                 && !repo.is_empty()
-                && self.tree.is_none()
                 && self.content_hashes.is_none()
                 && self.modified_filepaths.is_empty()
             {
@@ -2222,7 +3216,18 @@ impl SourceHasher<'_> {
                         .join(external_label_path(target));
                     let path = self.external_resolver.output_base.join(&key);
                     match fs::metadata(&path) {
-                        Ok(metadata) if metadata.is_file() => {
+                        // Preserve both the legacy apparent content key and the
+                        // canonical key of the observed-file resolver.
+                        Ok(metadata)
+                            if metadata.is_file()
+                                && self.tree.is_none_or(|tree| {
+                                    tree.content_hash(&key.to_string_lossy()).is_none()
+                                        && (canonical
+                                            || tree
+                                                .content_hash(&paths().1.to_string_lossy())
+                                                .is_none())
+                                }) =>
+                        {
                             return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
                         }
                         Ok(_) => {}
@@ -2582,6 +3587,228 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn typed_sibling_rules_follow_their_own_source_and_the_shared_tool() {
+        use crate::bazel::{RegistrationPath, StaticToolchainDeclaration};
+        use crate::proto::blaze_query::rule::PossibleToolchainTypes;
+
+        // Loading rows from two generated libraries using the same toolchain.
+        let a = "@@ext++crates+crates__a//:lib";
+        let b = "@@ext++crates+crates__b//:lib";
+        let ty = "@@ext+//:sdk_type";
+        let registration = "@@ext++crates+sdk_provider//:registration";
+        let body = "@@ext++crates+sdk_provider//:impl";
+        let owner = "//external:!unresolved-module-ext+!ext";
+        let b_repo = "//external:ext++crates+crates__b";
+        let a_src = "@@ext++crates+crates__a//:data.txt";
+        let b_src = "@@ext++crates+crates__b//:data.txt";
+        let tool = "@@ext+//:tool.sh";
+
+        let workspace = tempfile::tempdir().unwrap();
+        let output_base = workspace.path().join("output");
+        let mut options = hash_options(workspace.path());
+        options
+            .bazel
+            .fine_grained_external_repos
+            .insert("@crates".into());
+        // Optional full-definition enrichment is unavailable, as on a released
+        // producer. All inputs to the supplier join below are explicit rows.
+        options.bazel.no_bazelrc = false;
+        options.bazel.bazel = "/bin/sh".into();
+        options.bazel.startup_options = vec![
+            "-c".into(),
+            r#"case "$0" in version) echo 'Build label: 8.8.2';; *) exit 3;; esac"#.into(),
+        ];
+        let rule = |name: &str, kind: &str, inputs: &[&str], types: &[&str]| Rule {
+            name: name.to_owned(),
+            rule_class: kind.to_owned(),
+            rule_input: inputs.iter().map(|s| (*s).to_owned()).collect(),
+            possible_toolchain_types: buffa::MessageField::some(PossibleToolchainTypes {
+                label: types.iter().map(|s| (*s).to_owned()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let snapshot = |version: &str, sdk: &str| {
+            for (repo, file, text) in [
+                ("ext+", "tool.sh", "sh"),
+                ("ext++crates+crates__a", "data.txt", "1"),
+                ("ext++crates+crates__b", "data.txt", version),
+            ] {
+                let dir = output_base.join("external").join(repo);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join(file), text).unwrap();
+            }
+            let mut metadata = StaticToolchains::default();
+            metadata
+                .by_type
+                .insert(ty.into(), vec![registration.into()]);
+            metadata
+                .type_paths
+                .insert(ty.into(), BTreeSet::from([ty.into()]));
+            metadata.registration_paths.insert(
+                registration.into(),
+                RegistrationPath {
+                    declarations: BTreeSet::from([registration.into()]),
+                    ..Default::default()
+                },
+            );
+            metadata.declarations.insert(
+                registration.into(),
+                StaticToolchainDeclaration {
+                    ty: ty.into(),
+                    implementations: BTreeSet::from([body.into()]),
+                    ordinary_inputs: BTreeSet::from([ty.into()]),
+                },
+            );
+            let mut sdk_rule = rule(body, "sdk", &[], &[]);
+            sdk_rule
+                .attribute
+                .push(string_list_attribute("version", &[sdk]));
+            let mut b_definition = rule(b_repo, "spoke", &[], &[]);
+            b_definition
+                .attribute
+                .push(string_list_attribute("version", &[version]));
+            let targets = vec![
+                rule_target(rule(a, "crate", &[tool, a_src], &[ty])),
+                rule_target(rule(b, "crate", &[tool, b_src], &[ty])),
+                rule_target(rule(owner, "unresolved_module", &[b_repo], &[])),
+                rule_target(rule(registration, "toolchain", &[ty], &[])),
+                rule_target(rule("//:holder", "filegroup", &[registration], &[])),
+                rule_target(rule(ty, "toolchain_type", &[], &[])),
+                rule_target(sdk_rule),
+                rule_target(b_definition),
+                source_target(tool, &[]),
+                source_target(a_src, &[]),
+                source_target(b_src, &[]),
+            ];
+            let resolver = ExternalRepoResolver {
+                workspace: workspace.path().into(),
+                output_base: output_base.clone(),
+                repo_mapping: Arc::new(OnceLock::from(HashMap::new())),
+                scoped_sources: ScopedSources {
+                    queried_files: [tool, a_src, b_src]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    supplier_reads: Some(Default::default()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            hash_targets_with_environment(
+                &options,
+                targets,
+                PreparedRules::default(),
+                resolver,
+                None,
+                Some(metadata),
+            )
+            .unwrap()
+        };
+
+        let base = snapshot("1", "1");
+        let new_b = snapshot("2", "1");
+        let new_sdk = snapshot("1", "2");
+        assert_ne!(base.hashes[owner], new_b.hashes[owner]);
+        assert_eq!(base.hashes[a], new_b.hashes[a]);
+        assert_ne!(base.hashes[b], new_b.hashes[b]);
+        assert!(base.dep_edges[registration].iter().any(|edge| edge == body));
+        assert_ne!(
+            base.hashes[registration].hash,
+            new_sdk.hashes[registration].hash
+        );
+        assert_eq!(
+            base.hashes[registration].direct_hash,
+            new_sdk.hashes[registration].direct_hash
+        );
+        assert_eq!(base.hashes["//:holder"], new_sdk.hashes["//:holder"]);
+        for reader in [a, b] {
+            assert!(base.dep_edges[reader].iter().any(|edge| edge == body));
+            assert_ne!(base.hashes[reader].hash, new_sdk.hashes[reader].hash);
+            assert_eq!(
+                base.hashes[reader].direct_hash,
+                new_sdk.hashes[reader].direct_hash
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_body_keeps_an_independent_apparent_input_direct() {
+        use crate::bazel::{RegistrationPath, StaticToolchainDeclaration};
+        use crate::proto::blaze_query::rule::PossibleToolchainTypes;
+
+        let ty = "//:type".to_owned();
+        let registration = "//:registration".to_owned();
+        let body = "@@archive+//:tool".to_owned();
+        let mapping = HashMap::from([("short".to_owned(), "archive+".to_owned())]);
+        let mut metadata = StaticToolchains::default();
+        metadata
+            .by_type
+            .insert(ty.clone(), vec![registration.clone()]);
+        metadata.type_paths.insert(ty.clone(), BTreeSet::new());
+        metadata.registration_paths.insert(
+            registration.clone(),
+            RegistrationPath {
+                declarations: BTreeSet::from([registration.clone()]),
+                ..Default::default()
+            },
+        );
+        metadata.declarations.insert(
+            registration.clone(),
+            StaticToolchainDeclaration {
+                ty: ty.clone(),
+                implementations: BTreeSet::from([body.clone()]),
+                ordinary_inputs: BTreeSet::new(),
+            },
+        );
+
+        for (ordinary, inferred) in [("@short//:tool", true), (body.as_str(), false)] {
+            let mut labels = Labels {
+                ids: HashMap::new(),
+                slots: Vec::new(),
+            };
+            for name in ["//:reader", &registration, &body] {
+                let mut rule = Rule {
+                    name: name.to_owned(),
+                    ..Default::default()
+                };
+                if name == "//:reader" {
+                    rule.rule_input.push(ordinary.to_owned());
+                    rule.possible_toolchain_types =
+                        buffa::MessageField::some(PossibleToolchainTypes {
+                            label: vec![ty.clone()],
+                            ..Default::default()
+                        });
+                }
+                labels.slot(name.to_owned()).rule = Some(Rc::new(RuleNode::new(
+                    rule,
+                    PreparedRule {
+                        definition_digest: [0; 32],
+                        shared_inputs: None,
+                        loading_inputs: Vec::new(),
+                    },
+                )));
+            }
+            let changes =
+                add_static_toolchain_inputs(&mut labels, &[], &metadata, &mapping, &HashSet::new());
+            let skipped = changes.derived_inputs.get("//:reader");
+            assert_eq!(skipped.is_some_and(|names| names.contains(&body)), inferred);
+            assert!(!skipped.is_some_and(|names| names.contains(ordinary)));
+            let inputs = &labels
+                .get("//:reader")
+                .unwrap()
+                .rule
+                .as_ref()
+                .unwrap()
+                .rule
+                .rule_input;
+            assert!(inputs.iter().any(|label| label == ordinary));
+            assert!(inputs.contains(&body));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scoped_directory_paths_preserve_distinct_non_utf8_names() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
@@ -2751,6 +3978,7 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
         )
     }
 
@@ -2772,6 +4000,7 @@ mod tests {
                 ..Default::default()
             },
             Some(r#"{"name":"root"}"#.to_owned()),
+            None,
         )?;
         assert_eq!(indexed.hashes, reference.hashes);
         assert_eq!(indexed.dep_edges, reference.dep_edges);
@@ -3191,6 +4420,7 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
             )
             .unwrap()
         };
@@ -3457,6 +4687,7 @@ esac
                     ..Default::default()
                 },
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
             )
             .unwrap()
         };
@@ -3882,13 +5113,14 @@ esac
                 ..Default::default()
             }),
         ];
-        let full = |tree: &TreeIndex| {
+        let generate = |tree: &TreeIndex, overrides| {
             let mut options = hash_options(workspace.path());
             options
                 .bazel
                 .fine_grained_external_repos
                 .insert("@maven".into());
             options.partial_tree = Some(Arc::new(tree.clone()));
+            options.content_hashes = overrides;
             let resolver = ExternalRepoResolver {
                 workspace: workspace.path().to_path_buf(),
                 bazel: PathBuf::from("bazel"),
@@ -3905,9 +5137,11 @@ esac
                 PreparedRules::default(),
                 resolver,
                 Some(r#"{"name":"root"}"#.to_owned()),
+                None,
             )
             .unwrap()
         };
+        let full = |tree: &TreeIndex| generate(tree, None);
         let tree = TreeIndex::parse_ls_tree(b"100644 blob a\tsrc\0");
         let before = full(&tree);
         let recipes = before.partial.as_ref().unwrap();
@@ -3930,6 +5164,18 @@ esac
             before.hashes["//:consumer"].hash,
             changed.hashes["//:consumer"].hash
         );
+
+        // The old CLI used every tracked blob as a content key. A matching
+        // apparent external key must still win over the physical jar. The
+        // noncolliding tree above reads that jar directly.
+        let collision = TreeIndex::parse_ls_tree(
+            b"100644 blob src\tsrc\x00100644 blob tracked-key\texternal/maven/guava.jar\0",
+        );
+        let eager = generate(&collision, Some(collision.content_hashes()));
+        let lazy = full(&collision);
+        assert_eq!(eager.hashes, lazy.hashes);
+        assert_eq!(eager.partial, lazy.partial);
+        assert_ne!(changed.hashes[external], lazy.hashes[external]);
     }
 
     #[cfg(unix)]
@@ -4134,6 +5380,7 @@ esac
             targets,
             prepared,
             ExternalRepoResolver::default(),
+            None,
             None,
         )
         .unwrap();

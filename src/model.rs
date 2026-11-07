@@ -216,6 +216,7 @@ impl Serialize for SerializedMetadata<'_> {
             "HashMetadata",
             usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
+                + usize::from(!self.data.registration_impacts.is_empty())
                 + usize::from(self.data.dependency_fingerprint.is_some())
                 + usize::from(self.data.partial.is_some())
                 + usize::from(self.data.tree.is_some()),
@@ -225,6 +226,9 @@ impl Serialize for SerializedMetadata<'_> {
         }
         if let Some(dependency_fingerprint) = &self.data.dependency_fingerprint {
             state.serialize_field("dependencyFingerprint", dependency_fingerprint)?;
+        }
+        if !self.data.registration_impacts.is_empty() {
+            state.serialize_field("registrationImpacts", &self.data.registration_impacts)?;
         }
         if include_dep_edges {
             state.serialize_field("depEdges", &self.data.dep_edges)?;
@@ -258,6 +262,7 @@ impl Serialize for SerializedHashFile<'_> {
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
             && self.data.tree.is_none()
+            && self.data.registration_impacts.is_empty()
             && (!self.include_deps || self.data.dep_edges.is_empty())
         {
             return hashes.serialize(serializer);
@@ -275,12 +280,22 @@ impl Serialize for SerializedHashFile<'_> {
     }
 }
 
+/// The declaration itself is a possible dependency of other rules. Its reported
+/// target hash additionally tracks the implementation(s) a build might select.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationImpact {
+    pub declaration_hash: String,
+    pub implementation_edges: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HashFileData {
     pub hashes: BTreeMap<String, TargetHash>,
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
+    pub registration_impacts: BTreeMap<String, RegistrationImpact>,
     /// Partial-graph mode (`--partialGraph`): the recipes a derivation re-evaluates.
     pub partial: Option<PartialRecipes>,
     /// Partial-graph mode: the id of the git tree the hashes describe, the base of a later
@@ -394,6 +409,8 @@ struct Metadata {
     #[serde(default)]
     dep_edges: BTreeMap<String, Vec<String>>,
     #[serde(default)]
+    registration_impacts: BTreeMap<String, RegistrationImpact>,
+    #[serde(default)]
     partial_graph: Option<PartialRecipes>,
     #[serde(default)]
     tree: Option<String>,
@@ -429,6 +446,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
+                            data.registration_impacts = metadata.registration_impacts;
                             data.partial = metadata.partial_graph;
                             data.tree = metadata.tree;
                         }
@@ -494,6 +512,7 @@ impl HashFileData {
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
             && self.tree.is_none()
+            && self.registration_impacts.is_empty()
             && (!include_deps || self.dep_edges.is_empty())
         {
             return Value::Object(hashes);
@@ -509,6 +528,12 @@ impl HashFileData {
             metadata.insert(
                 "dependencyFingerprint".to_owned(),
                 Value::String(dependency_fingerprint.clone()),
+            );
+        }
+        if !self.registration_impacts.is_empty() {
+            metadata.insert(
+                "registrationImpacts".to_owned(),
+                serde_json::json!(self.registration_impacts),
             );
         }
         if include_deps && !self.dep_edges.is_empty() {
@@ -591,15 +616,13 @@ pub fn impacted_targets(
                 .get(*label)
                 .is_some_and(|previous| previous.same_as(hash))
         })
-        .map(|(label, _)| label.clone())
-        .filter(|label| !exclude_external || !label.starts_with("//external:"))
-        .filter_map(|label| match accepts(&label, to, target_types) {
-            Ok(true) => Some(Ok(label)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|(label, _)| label.clone());
     filter_and_sort_labels(impacted, from, to, target_types, exclude_external)
+}
+
+fn report_target(label: &str, exclude_external: bool) -> bool {
+    !crate::bazel::is_repository_fallback(label)
+        && (!exclude_external || !label.starts_with("//external:"))
 }
 
 pub fn filter_and_sort_labels(
@@ -611,7 +634,7 @@ pub fn filter_and_sort_labels(
 ) -> Result<Vec<String>> {
     let mut impacted = labels
         .into_iter()
-        .filter(|label| !exclude_external || !label.starts_with("//external:"))
+        .filter(|label| report_target(label, exclude_external))
         .filter_map(|label| match accepts(&label, to, target_types) {
             Ok(true) => Some(Ok(label)),
             Ok(false) => None,
@@ -704,10 +727,134 @@ fn reverse_distances<'a>(
     distances
 }
 
+/// Dependency edges for attribution. An implementation change is reported on
+/// its registration, but is not a change to the declaration seen by its callers.
+pub struct ImpactEdges<'a> {
+    edges: &'a BTreeMap<String, Vec<String>>,
+    registrations: &'a BTreeMap<String, RegistrationImpact>,
+    implementation_only: HashSet<&'a str>,
+}
+
+impl<'a> ImpactEdges<'a> {
+    #[cfg(test)]
+    pub(crate) fn flat(edges: &'a BTreeMap<String, Vec<String>>) -> Self {
+        static EMPTY: BTreeMap<String, RegistrationImpact> = BTreeMap::new();
+        Self {
+            edges,
+            registrations: &EMPTY,
+            implementation_only: HashSet::new(),
+        }
+    }
+
+    pub fn between(
+        edges: &'a BTreeMap<String, Vec<String>>,
+        from: &'a HashFileData,
+        to: &'a HashFileData,
+    ) -> Self {
+        let mut implementation_only = HashSet::new();
+        for label in from
+            .registration_impacts
+            .keys()
+            .chain(to.registration_impacts.keys())
+        {
+            let (Some(before), Some(after)) = (from.hashes.get(label), to.hashes.get(label)) else {
+                continue;
+            };
+            if before.same_as(after)
+                || before.kind != after.kind
+                || before.direct_hash != after.direct_hash
+            {
+                continue;
+            }
+            let same_declaration = match (
+                from.registration_impacts.get(label),
+                to.registration_impacts.get(label),
+            ) {
+                (Some(a), Some(b)) => a.declaration_hash == b.declaration_hash,
+                (Some(a), None) => after.hash == a.declaration_hash.as_str(),
+                (None, Some(b)) => before.hash == b.declaration_hash.as_str(),
+                (None, None) => unreachable!("label came from a registration table"),
+            };
+            if same_declaration {
+                implementation_only.insert(label.as_str());
+            }
+        }
+        Self {
+            edges,
+            registrations: &to.registration_impacts,
+            implementation_only,
+        }
+    }
+
+    /// Only the requested target can report an implementation edge. In the
+    /// middle of an explanation, a registration contributes its declaration.
+    pub(crate) fn dependencies(
+        &self,
+        label: &str,
+        report_implementation: bool,
+    ) -> impl Iterator<Item = &str> {
+        let registration = self.registrations.get(label);
+        let declaration_changed = !self.implementation_only.contains(label);
+        self.edges
+            .get(label)
+            .into_iter()
+            .flatten()
+            .filter(move |dep| {
+                let implementation =
+                    registration.is_some_and(|r| r.implementation_edges.contains(dep));
+                (if implementation {
+                    report_implementation
+                } else {
+                    declaration_changed
+                }) && !self.implementation_only.contains(dep.as_str())
+            })
+            .map(String::as_str)
+    }
+
+    /// Add a last hop to the declaration's reported distance after traversal,
+    /// so that a shorter implementation path cannot escape into its callers.
+    fn reported_distance(
+        &self,
+        label: &str,
+        distances: &HashMap<&str, usize>,
+        changed: &HashMap<String, ImpactType>,
+        edge_cost: impl Fn(&str, &str) -> usize,
+    ) -> usize {
+        let ordinary = (!self.implementation_only.contains(label))
+            .then(|| distances.get(label).copied().unwrap_or(0));
+        let implementations = self
+            .registrations
+            .get(label)
+            .into_iter()
+            .flat_map(|entry| &entry.implementation_edges)
+            .filter(|dep| {
+                changed.contains_key(dep.as_str())
+                    && !self.implementation_only.contains(dep.as_str())
+                    && self.edges.get(label).is_some_and(|deps| deps.contains(dep))
+            })
+            .map(|dep| {
+                distances
+                    .get(dep.as_str())
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(edge_cost(dep, label))
+            });
+        ordinary
+            .into_iter()
+            .chain(implementations)
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+fn package_cost(dependency: &str, dependent: &str) -> usize {
+    usize::from(dependency.split(':').next() != dependent.split(':').next())
+}
+
 pub fn impacted_targets_with_distances(
     from: &BTreeMap<String, TargetHash>,
     to: &BTreeMap<String, TargetHash>,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+    graph: ImpactEdges<'_>,
     target_types: Option<&HashSet<String>>,
     exclude_external: bool,
 ) -> Result<Vec<ImpactedTargetWithDistance>> {
@@ -715,16 +862,16 @@ pub fn impacted_targets_with_distances(
     let mut dependents = HashMap::<&str, Vec<&str>>::new();
     let mut roots = Vec::new();
     for (label, impact) in &impact_types {
+        if graph.implementation_only.contains(label.as_str()) {
+            continue;
+        }
         if *impact == ImpactType::Direct {
             roots.push(label.as_str());
             continue;
         }
         let mut has_impacted_dependency = false;
-        for dependency in dep_edges
-            .get(label)
-            .into_iter()
-            .flatten()
-            .map(String::as_str)
+        for dependency in graph
+            .dependencies(label, false)
             .filter(|dependency| impact_types.contains_key(*dependency))
         {
             has_impacted_dependency = true;
@@ -738,18 +885,12 @@ pub fn impacted_targets_with_distances(
         }
     }
     let target_distances = reverse_distances(&dependents, &roots, |_, _| 1);
-    let package_distances = reverse_distances(&dependents, &roots, |dependency, dependent| {
-        usize::from(
-            dependency.split(':').next().unwrap_or(dependency)
-                != dependent.split(':').next().unwrap_or(dependent),
-        )
-    });
+    let package_distances = reverse_distances(&dependents, &roots, package_cost);
     // An unreached label belongs to or depends on a rootless changed component. The graph
     // identifies no origin for it, so retain the conservative fallback of distance zero.
-    let unresolved = impact_types
-        .keys()
-        .map(String::as_str)
-        .filter(|label| !target_distances.contains_key(label));
+    let unresolved = impact_types.keys().map(String::as_str).filter(|label| {
+        !graph.implementation_only.contains(label) && !target_distances.contains_key(label)
+    });
     let (count, representative) =
         unresolved.fold((0_usize, None), |(count, representative), label| {
             (
@@ -765,14 +906,12 @@ pub fn impacted_targets_with_distances(
     let impacted = impact_types
         .keys()
         .map(String::as_str)
-        .filter(|label| !exclude_external || !label.starts_with("//external:"))
+        .filter(|label| report_target(label, exclude_external))
         .filter_map(|label| {
-            let (target_distance, package_distance) =
-                match (target_distances.get(label), package_distances.get(label)) {
-                    (Some(target), Some(package)) => (*target, *package),
-                    (None, None) => (0, 0),
-                    _ => unreachable!("both distance walks use the same graph and origins"),
-                };
+            let target_distance =
+                graph.reported_distance(label, &target_distances, &impact_types, |_, _| 1);
+            let package_distance =
+                graph.reported_distance(label, &package_distances, &impact_types, package_cost);
             match accepts(label, to, target_types) {
                 Ok(true) => Some(Ok(ImpactedTargetWithDistance {
                     label: label.to_owned(),
@@ -845,6 +984,77 @@ mod tests {
     }
 
     #[test]
+    fn implementation_changes_end_at_the_registration() {
+        use crate::explain::{explain, ExplainLimits};
+
+        let edges = BTreeMap::from([
+            ("//:registration".into(), vec!["//:compiler".into()]),
+            (
+                "//:holder".into(),
+                vec!["//:registration".into(), "//one:link".into()],
+            ),
+            ("//one:link".into(), vec!["//two:link".into()]),
+            ("//two:link".into(), vec!["//data:file".into()]),
+        ]);
+        let snapshot = |revision: &str| {
+            let mut data = HashFileData::default();
+            for label in [
+                "//:holder",
+                "//one:link",
+                "//two:link",
+                "//:registration",
+                "//data:file",
+                "//:compiler",
+            ] {
+                let direct = if matches!(label, "//:compiler" | "//data:file") {
+                    revision
+                } else {
+                    "same"
+                };
+                data.hashes
+                    .insert(label.into(), target("Rule", revision, direct));
+            }
+            data.registration_impacts.insert(
+                "//:registration".into(),
+                RegistrationImpact {
+                    declaration_hash: "same-binding".into(),
+                    implementation_edges: vec!["//:compiler".into()],
+                },
+            );
+            let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
+            HashFileData::from_slice(&bytes).unwrap()
+        };
+        let from = snapshot("before");
+        let to = snapshot("after");
+        let graph = || ImpactEdges::between(&edges, &from, &to);
+        let distances =
+            impacted_targets_with_distances(&from.hashes, &to.hashes, graph(), None, false)
+                .unwrap();
+        let distance = |name| {
+            let row = distances.iter().find(|row| row.label == name).unwrap();
+            (row.target_distance, row.package_distance)
+        };
+        assert_eq!(distance("//:registration"), (1, 0));
+        assert_eq!(distance("//:holder"), (3, 3));
+        for (target, cause) in [
+            ("//:registration", "//:compiler"),
+            ("//:holder", "//data:file"),
+        ] {
+            let result = explain(
+                &from.hashes,
+                &to.hashes,
+                graph(),
+                target,
+                ExplainLimits::default(),
+            )
+            .unwrap();
+            let roots = result.explanation.root_causes;
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].label, cause);
+        }
+    }
+
+    #[test]
     fn computes_shortest_target_and_package_distances_independently() {
         let from = BTreeMap::from([
             ("//a:leaf".into(), target("Rule", "old", "old")),
@@ -860,7 +1070,9 @@ mod tests {
             ("//a:mid".into(), vec!["//a:leaf".into()]),
             ("//b:top".into(), vec!["//a:mid".into()]),
         ]);
-        let result = impacted_targets_with_distances(&from, &to, &edges, None, false).unwrap();
+        let result =
+            impacted_targets_with_distances(&from, &to, ImpactEdges::flat(&edges), None, false)
+                .unwrap();
         assert_eq!(result[2].target_distance, 2);
         assert_eq!(result[2].package_distance, 1);
     }
@@ -1108,18 +1320,57 @@ mod tests {
 
     #[test]
     fn unchanged_hashes_and_external_filters_are_excluded() {
+        let imported = "//external:!unresolved-import-repo++ext+hub!hub";
+        let module = "//external:!unresolved-module-repo+!repo";
         let from = BTreeMap::from([
             ("//a:a".into(), target("Rule", "same", "same")),
+            (
+                "//a:consumer".into(),
+                target("Rule", "old-consumer", "same-consumer"),
+            ),
             ("//external:r".into(), target("Rule", "old", "old")),
+            (imported.into(), target("Rule", "old-import", "old-import")),
+            (module.into(), target("Rule", "old-module", "same-module")),
         ]);
         let to = BTreeMap::from([
             ("//a:a".into(), target("Rule", "same", "same")),
+            (
+                "//a:consumer".into(),
+                target("Rule", "new-consumer", "same-consumer"),
+            ),
             ("//external:r".into(), target("Rule", "new", "new")),
+            (imported.into(), target("Rule", "new-import", "new-import")),
+            (module.into(), target("Rule", "new-module", "same-module")),
         ]);
-        assert!(impacted_targets(&from, &to, None, true).unwrap().is_empty());
+        assert_eq!(
+            impacted_targets(&from, &to, None, true).unwrap(),
+            ["//a:consumer"]
+        );
         assert_eq!(
             impacted_targets(&from, &to, None, false).unwrap(),
-            ["//external:r"]
+            ["//a:consumer", "//external:r"]
+        );
+        let edges = BTreeMap::from([
+            (module.into(), vec![imported.into()]),
+            ("//a:consumer".into(), vec![module.into()]),
+        ]);
+        let distances =
+            impacted_targets_with_distances(&from, &to, ImpactEdges::flat(&edges), None, false)
+                .unwrap()
+                .into_iter()
+                .map(|target| {
+                    (
+                        target.label,
+                        (target.target_distance, target.package_distance),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            distances,
+            BTreeMap::from([
+                ("//a:consumer".into(), (2, 1)),
+                ("//external:r".into(), (0, 0)),
+            ])
         );
     }
 
@@ -1141,12 +1392,20 @@ mod tests {
             ("//c:cycle".into(), vec!["//c:cycle".into()]),
         ]);
         let source_only = HashSet::from(["SourceFile".to_owned()]);
-        let filtered =
-            impacted_targets_with_distances(&from, &to, &edges, Some(&source_only), false).unwrap();
+        let filtered = impacted_targets_with_distances(
+            &from,
+            &to,
+            ImpactEdges::flat(&edges),
+            Some(&source_only),
+            false,
+        )
+        .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].label, "//d:added");
 
-        let all = impacted_targets_with_distances(&from, &to, &edges, None, false).unwrap();
+        let all =
+            impacted_targets_with_distances(&from, &to, ImpactEdges::flat(&edges), None, false)
+                .unwrap();
         let indirect = all
             .iter()
             .find(|target| target.label == "//b:indirect")
@@ -1225,7 +1484,9 @@ mod tests {
             ("//a:orphan".into(), vec!["//c:unchanged".into()]),
             ("//b:dependent".into(), vec!["//a:orphan".into()]),
         ]);
-        let result = impacted_targets_with_distances(&from, &to, &edges, None, false).unwrap();
+        let result =
+            impacted_targets_with_distances(&from, &to, ImpactEdges::flat(&edges), None, false)
+                .unwrap();
         assert_eq!(
             result,
             [
@@ -1243,8 +1504,14 @@ mod tests {
         );
 
         // The same without any edges at all: every indirect impact is unattributable.
-        let result =
-            impacted_targets_with_distances(&from, &to, &BTreeMap::new(), None, false).unwrap();
+        let result = impacted_targets_with_distances(
+            &from,
+            &to,
+            ImpactEdges::flat(&BTreeMap::new()),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(
             result
                 .iter()
@@ -1266,11 +1533,15 @@ mod tests {
         assert!(impacted_targets(&from, &to, None, false)
             .unwrap()
             .is_empty());
-        assert!(
-            impacted_targets_with_distances(&from, &to, &BTreeMap::new(), None, false)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(impacted_targets_with_distances(
+            &from,
+            &to,
+            ImpactEdges::flat(&BTreeMap::new()),
+            None,
+            false
+        )
+        .unwrap()
+        .is_empty());
     }
 
     /// Ordering puts source files first, then generated files, then rules; any other kind
@@ -1307,11 +1578,17 @@ mod tests {
         );
 
         let from = BTreeMap::new();
-        let distances = impacted_targets_with_distances(&from, &to, &BTreeMap::new(), None, false)
-            .unwrap()
-            .into_iter()
-            .map(|target| target.label)
-            .collect::<Vec<_>>();
+        let distances = impacted_targets_with_distances(
+            &from,
+            &to,
+            ImpactEdges::flat(&BTreeMap::new()),
+            None,
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|target| target.label)
+        .collect::<Vec<_>>();
         assert_eq!(
             distances,
             ["//z:source", "//m:rule", "//a:package_group", "//a:untyped"]

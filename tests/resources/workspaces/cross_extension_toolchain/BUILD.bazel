@@ -1,0 +1,18 @@
+load("@sdk//:defs.bzl", "consumer")
+
+consumer(name = "consumer")
+
+filegroup(
+    name = "neighbor",
+    srcs = ["@assets//:neighbor"],
+)
+
+genrule(
+    name = "products",
+    srcs = [
+        ":consumer",
+        ":neighbor",
+    ],
+    outs = ["products.txt"],
+    cmd = "cat $(location :consumer) $(location :neighbor) > $@",
+)

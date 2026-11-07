@@ -1,0 +1,4 @@
+module(name = "assets")
+
+values = use_extension("//:values.bzl", "values")
+use_repo(values, "neighbor", "payload")

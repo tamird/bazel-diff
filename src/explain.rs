@@ -7,7 +7,7 @@
 //! consumes -- it runs no Bazel query and needs no workspace, so it is cheap
 //! enough to run on a CI failure after the fact.
 
-use crate::model::{impacted_types, ImpactType, TargetHash};
+use crate::model::{impacted_types, ImpactEdges, ImpactType, TargetHash};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -151,7 +151,7 @@ pub struct ExplainOutcome {
 pub fn explain(
     from: &BTreeMap<String, TargetHash>,
     to: &BTreeMap<String, TargetHash>,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+    graph: ImpactEdges<'_>,
     target: &str,
     limits: ExplainLimits,
 ) -> Result<ExplainOutcome, UnknownTargetError> {
@@ -184,7 +184,7 @@ pub fn explain(
     }
 
     let (distances, parents, truncated_by_depth) =
-        walk_upstream(target, dep_edges, &impacted, limits.max_depth);
+        walk_upstream(target, &graph, &impacted, limits.max_depth);
     if truncated_by_depth {
         warnings.push(format!(
             "Stopped the search at --maxDepth={} hops above {target}; root causes further \
@@ -235,7 +235,7 @@ pub fn explain(
         all_roots
     };
 
-    let (nodes, edges) = build_subgraph(&kept, target, &distances, &impacted, dep_edges, to, from);
+    let (nodes, edges) = build_subgraph(&kept, target, &distances, &impacted, &graph, to, from);
 
     Ok(ExplainOutcome {
         explanation: ImpactExplanation {
@@ -262,7 +262,7 @@ pub fn explain(
 #[allow(clippy::type_complexity)]
 fn walk_upstream(
     target: &str,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+    dep_edges: &ImpactEdges<'_>,
     impacted: &HashMap<String, ImpactType>,
     max_depth: Option<usize>,
 ) -> (BTreeMap<String, usize>, HashMap<String, String>, bool) {
@@ -273,12 +273,9 @@ fn walk_upstream(
 
     while let Some(current) = queue.pop_front() {
         let depth = distances[&current];
-        let deps = dep_edges.get(&current).map(Vec::as_slice).unwrap_or(&[]);
+        let mut deps = dep_edges.dependencies(&current, current == target);
         if max_depth.is_some_and(|max| depth >= max) {
-            if deps
-                .iter()
-                .any(|dep| impacted.contains_key(dep) && !distances.contains_key(dep))
-            {
+            if deps.any(|dep| impacted.contains_key(dep) && !distances.contains_key(dep)) {
                 truncated_by_depth = true;
             }
             continue;
@@ -287,9 +284,9 @@ fn walk_upstream(
             if !impacted.contains_key(dep) || distances.contains_key(dep) {
                 continue;
             }
-            distances.insert(dep.clone(), depth + 1);
-            parents.insert(dep.clone(), current.clone());
-            queue.push_back(dep.clone());
+            distances.insert(dep.to_owned(), depth + 1);
+            parents.insert(dep.to_owned(), current.clone());
+            queue.push_back(dep.to_owned());
         }
     }
 
@@ -316,7 +313,7 @@ fn build_subgraph(
     target: &str,
     distances: &BTreeMap<String, usize>,
     impacted: &HashMap<String, ImpactType>,
-    dep_edges: &BTreeMap<String, Vec<String>>,
+    dep_edges: &ImpactEdges<'_>,
     to: &BTreeMap<String, TargetHash>,
     from: &BTreeMap<String, TargetHash>,
 ) -> (Vec<ExplainNode>, Vec<ExplainEdge>) {
@@ -354,13 +351,10 @@ fn build_subgraph(
         .iter()
         .flat_map(|consumer| {
             dep_edges
-                .get(consumer)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
-                .iter()
+                .dependencies(consumer, consumer == target)
                 .filter(|dep| included.contains(*dep))
                 .map(|dep| ExplainEdge {
-                    from: dep.clone(),
+                    from: dep.to_owned(),
                     to: consumer.clone(),
                 })
         })
@@ -790,7 +784,7 @@ mod tests {
         target: &str,
         limits: ExplainLimits,
     ) -> ImpactExplanation {
-        explain(from, to, edges, target, limits)
+        explain(from, to, ImpactEdges::flat(edges), target, limits)
             .unwrap()
             .explanation
     }
@@ -964,7 +958,7 @@ mod tests {
         let error = explain(
             &base,
             &base,
-            &dep_edges(),
+            ImpactEdges::flat(&dep_edges()),
             "//typo:nope",
             ExplainLimits::default(),
         )
@@ -998,7 +992,7 @@ mod tests {
         let outcome = explain(
             &from,
             &to,
-            &edges,
+            ImpactEdges::flat(&edges),
             "//app:app",
             ExplainLimits {
                 max_depth: None,
@@ -1038,7 +1032,7 @@ mod tests {
         let outcome = explain(
             &unchanged_base(),
             &upstream_change(),
-            &dep_edges(),
+            ImpactEdges::flat(&dep_edges()),
             "//service/a:app",
             ExplainLimits {
                 max_depth: Some(2),

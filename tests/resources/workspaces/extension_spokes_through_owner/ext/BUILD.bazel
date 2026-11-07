@@ -1,1 +1,3 @@
 exports_files(["tool.sh"])
+
+toolchain_type(name = "sdk_type", visibility = ["//visibility:public"])

@@ -99,8 +99,13 @@ skips that query when it can:
   whose tree the local clone does not have. A fallback costs speed, never correctness, and the
   log says which path each run took. A modified file no target reads impacts nothing, as it
   would in a full generation.
+* An offline derivation uses the base's recorded toolchain graph mode. It checks the explicit
+  hash options and recipe version before reuse, including when the Git tree is identical. It
+  does not start Bazel to identify a newly selected producer. Generate a fresh base when switching
+  producers, or use the server's explicit dependency fingerprint to authenticate an online lookup.
 * The file a derivation writes is byte-identical to the one a full generation under the flag
-  writes for the same tree, so derived files are themselves bases for later runs. A base that
+  writes for the same tree with the same graph mode and hash options, so derived files are themselves
+  bases for later runs. A base that
   already describes the workspace's tree is written back as is. With `--depEdgesFile` the hash
   file also carries the dependency edges, so a derivation can write them; a base without them
   cannot feed `--depEdgesFile` and forces a full generation.
@@ -214,6 +219,20 @@ so `explain` and `--depEdgesFile` always agree on which targets are roots.
 
 `--depEdgesFile` is required: attribution is a walk over those edges. Generate it with
 `generate-hashes --depEdgesFile` (or, on the query service, fetch it from `GET /dependency_edges`).
+
+When Bazel reports declared toolchain types and MODULE registrations, a hash file can include
+`metadata.registrationImpacts`. Each entry keeps the declaration hash and possible implementation
+edges separate. bazel-diff uses these entries for distances and explanations: a change to an
+implementation reports the registration, while an ordinary rule that references the registration
+follows its declaration. The flat `depEdges` output still includes possible implementation edges;
+consumers that read it directly retain conservative propagation.
+
+Ordinary loading does not select one configured toolchain. A rule that exposes a registration
+outside MODULE keeps a possible implementation dependency when its returned dependency subtree
+contains a matching toolchain requirement or an unresolved input. That uncertainty stays on the
+referrer and can select it even when a particular configuration does not use the tool. Configured
+decisions require a separate `--useCquery` invocation with the actual root targets and Bazel
+configuration options.
 
 ### Visualizing the blame graph
 
@@ -677,10 +696,10 @@ A few inputs are normalized or extended on the way in:
   dependency query adds their dependencies and build files. Each reached native alias hashes its
   evaluated `actual` binding, including the destination for each `select()` condition. Acquired
   library rules also hash the BUILD and Starlark files that define them.
-  Earlier Bazel versions skip this alias acquisition. Full source hashing with these repository
-  options reads every returned regular external source file from Bazel's output base, including
-  files in the primary query. The same read applies when no alias query runs. Partial mode and
-  source overrides use repository inputs for files outside the named repositories.
+  Earlier Bazel versions skip this alias acquisition. When Bazel returns a regular external source
+  file that bazel-diff can resolve in the output base, full hashing reads it and partial generation
+  records its digest for reuse. This includes files in the primary query. Explicit source overrides
+  retain their existing behavior based on repository inputs for files outside the named repositories.
   A supplemental query failure stops strict generation. With `--keep_going`, generation reports
   the failure and uses the primary target graph.
 * A **repository rule** (`//external:*`) that pins its download with `sha256` or `integrity` is
@@ -690,16 +709,19 @@ A few inputs are normalized or extended on the way in:
   An attribute that names a workspace path absolutely (a crate or Go module built from a directory
   in the workspace, a `file://%workspace%` registry URL) is hashed relative to the workspace, so
   identical checkouts at different paths hash the same.
-  In query mode the module that owns a module extension stands in for every repository the
-  extension generates, because a toolchain resolved from one of them is not a query input. Every
-  target that uses a rule of the owning module, every target of a module with a `bazel_dep` path
-  to it, and every fine-grained target inside one of those repositories therefore changes whenever
-  any repository of the extension does: a `go.mod` bump through gazelle's `go_deps` or a
-  `pnpm-lock.yaml` bump through rules_js's `npm` impacts most of the workspace. Listing the
-  extension in `--labelOnlyModuleExtensions` (for example
+  In ordinary query mode, a repository definition is separate from conservative inventories
+  of repositories generated by module extensions. Returned target inputs carry changes through the
+  ordinary graph. Missing inputs and unresolved suppliers retain the relevant inventory scope,
+  which can still select a reader when another repository in that scope changes.
+  When Bazel reports declared toolchain types and MODULE registrations, readers also follow
+  matching registered implementations. Without that metadata, ordinary CLI generation with
+  supported Bzlmod discovery and no source overrides can recover default type inputs by comparing
+  sampled query walks with complete proto input rows. These supplemental reads use `--nofetch`;
+  incomplete results keep conservative dependencies on the repository scopes they can identify.
+  Listing the extension in `--labelOnlyModuleExtensions` (for example
   `@gazelle//:extensions.bzl%go_deps` or `@rules_rs//rs:extensions.bzl%crate`) asserts that its
-  repositories are used only through labels, which the query reports, so the owning module no
-  longer stands in for them. Do not list an extension that generates a toolchain, such as
+  repositories are used only through labels, which the query reports, so their inventory is omitted
+  from the owning module's fallback. Do not list an extension that generates a toolchain, such as
   `rules_go`'s `go_sdk`: a change to it would be missed. An extension whose name another `.bzl` file of the same
   module also exports is reported and ignored, since Bazel tells their repositories apart only by
   a numeric suffix.
@@ -711,7 +733,8 @@ A few inputs are normalized or extended on the way in:
   that constructs another filename relative to a label is not covered by that label alone.
   The named effective root import must be the only imported member. The query includes its
   dependency closure and build files. Each observed outside consumer retains the whole usage, including hidden siblings.
-  Other usages keep their existing owner dependencies. Generation requires ordinary query with
+  Consumers of other usages continue to track their repository and toolchain inputs.
+  Generation requires ordinary query with
   supported Bzlmod discovery and fails on an unrecognized mapping, an incomplete inventory, or a
   known outside repository-file reader.
   Typed labels hash their contents, mode, and absence at their filesystem location, regardless

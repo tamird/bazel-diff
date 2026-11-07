@@ -1,0 +1,60 @@
+load(":defs.bzl", "explicit_reader", "holder", "ordinary_reader", "reader", "tool")
+
+toolchain_type(name = "type")
+
+tool(
+    name = "primary",
+    payload = "primary.txt",
+)
+
+tool(
+    name = "spare",
+    payload = "spare.txt",
+)
+
+tool(
+    name = "fallback",
+    payload = "fallback.txt",
+)
+
+toolchain(
+    name = "default_registration",
+    toolchain = ":fallback",
+    toolchain_type = ":type",
+)
+
+toolchain(
+    name = "available",
+    toolchain = ":primary",
+    toolchain_type = ":type",
+)
+
+filegroup(
+    name = "leaf",
+    srcs = ["other.txt"],
+)
+
+filegroup(
+    name = "middle",
+    srcs = [":leaf"],
+)
+
+filegroup(
+    name = "through",
+    srcs = [":middle"],
+)
+
+holder(
+    name = "holder",
+    other = ":through",
+    registration = ":available",
+)
+
+reader(name = "reader")
+
+ordinary_reader(name = "default_reader")
+
+explicit_reader(
+    name = "explicit",
+    registration = ":available",
+)

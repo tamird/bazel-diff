@@ -5,6 +5,7 @@ use crate::git::{self, DerivationPolicy, Git};
 use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
+    ImpactEdges,
 };
 use crate::module_graph::{bzlmod_enabled_for, impacted_with_module_changes};
 use crate::partial::{self, Classification, Glob, TreeIndex, TreeKind};
@@ -1702,7 +1703,7 @@ fn compute_query(
         serde_json::to_value(impacted_targets_with_distances(
             &distance_from,
             &to.hashes,
-            &to.dep_edges,
+            ImpactEdges::between(&to.dep_edges, &from, &to),
             inputs.target_types.as_ref(),
             exclude_external,
         )?)?
@@ -1951,7 +1952,9 @@ fn retrieve_hashes_locked(
             index.len(),
             elapsed_millis(listed_started)
         );
-        options.content_hashes = Some(index.content_hashes());
+        if !state.config.partial_graph {
+            options.content_hashes = Some(index.content_hashes());
+        }
         tree = Some(Arc::new(index));
     }
     let mut partial_profile = PartialProfile::default();

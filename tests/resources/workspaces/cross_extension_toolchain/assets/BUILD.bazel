@@ -1,0 +1,11 @@
+alias(
+    name = "payload",
+    actual = "@payload//:value.txt",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "neighbor",
+    actual = "@neighbor//:value.txt",
+    visibility = ["//visibility:public"],
+)
