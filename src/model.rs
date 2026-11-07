@@ -201,6 +201,51 @@ impl Serialize for SerializedHashes<'_> {
     }
 }
 
+/// The exact emitted repository pairs supplied by conservative extension-membership
+/// coverage. Each anchor has at most one group. Common hubs share their members.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryMembership {
+    pub version: u32,
+    /// Absent on a hashes-only base. An empty present map records a tracked head
+    /// whose graph has no inferred membership edges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groups: Option<BTreeMap<String, Vec<String>>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
+}
+
+impl Default for RepositoryMembership {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            groups: None,
+            inputs: BTreeMap::new(),
+        }
+    }
+}
+
+impl RepositoryMembership {
+    fn supported(&self, hashes: &BTreeMap<String, TargetHash>) -> bool {
+        self.version == 1
+            && match &self.groups {
+                None => self.inputs.is_empty(),
+                Some(groups) => {
+                    self.inputs
+                        .iter()
+                        .all(|(parent, id)| hashes.contains_key(parent) && groups.contains_key(id))
+                        && groups.values().all(|members| members.is_sorted())
+                }
+            }
+    }
+
+    fn members(&self, parent: &str) -> &[String] {
+        self.inputs
+            .get(parent)
+            .and_then(|id| self.groups.as_ref()?.get(id))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
 struct SerializedMetadata<'a> {
     data: &'a HashFileData,
     include_deps: bool,
@@ -214,12 +259,16 @@ impl Serialize for SerializedMetadata<'_> {
         let include_dep_edges = self.include_deps && !self.data.dep_edges.is_empty();
         let mut state = serializer.serialize_struct(
             "HashMetadata",
-            usize::from(self.data.module_graph_json.is_some())
+            usize::from(self.data.repository_membership.is_some())
+                + usize::from(self.data.module_graph_json.is_some())
                 + usize::from(include_dep_edges)
                 + usize::from(self.data.dependency_fingerprint.is_some())
                 + usize::from(self.data.partial.is_some())
                 + usize::from(self.data.tree.is_some()),
         )?;
+        if let Some(membership) = &self.data.repository_membership {
+            state.serialize_field("repositoryMembership", membership)?;
+        }
         if let Some(module_graph_json) = &self.data.module_graph_json {
             state.serialize_field("moduleGraphJson", module_graph_json)?;
         }
@@ -254,7 +303,8 @@ impl Serialize for SerializedHashFile<'_> {
             hashes: &self.data.hashes,
             include_target_type: self.include_target_type,
         };
-        if self.data.module_graph_json.is_none()
+        if self.data.repository_membership.is_none()
+            && self.data.module_graph_json.is_none()
             && self.data.dependency_fingerprint.is_none()
             && self.data.partial.is_none()
             && self.data.tree.is_none()
@@ -278,6 +328,7 @@ impl Serialize for SerializedHashFile<'_> {
 #[derive(Clone, Debug, Default)]
 pub struct HashFileData {
     pub hashes: BTreeMap<String, TargetHash>,
+    pub repository_membership: Option<RepositoryMembership>,
     pub module_graph_json: Option<String>,
     pub dependency_fingerprint: Option<String>,
     pub dep_edges: BTreeMap<String, Vec<String>>,
@@ -389,6 +440,7 @@ impl<'de> Deserialize<'de> for Hashes {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Metadata {
+    repository_membership: Option<RepositoryMembership>,
     module_graph_json: Option<String>,
     dependency_fingerprint: Option<String>,
     #[serde(default)]
@@ -426,6 +478,7 @@ impl<'de> Deserialize<'de> for HashFileData {
                         }
                         "metadata" => {
                             let metadata = map.next_value::<Metadata>()?;
+                            data.repository_membership = metadata.repository_membership;
                             data.module_graph_json = metadata.module_graph_json;
                             data.dependency_fingerprint = metadata.dependency_fingerprint;
                             data.dep_edges = metadata.dep_edges;
@@ -490,7 +543,8 @@ impl HashFileData {
                 )
             })
             .collect::<Map<_, _>>();
-        if self.module_graph_json.is_none()
+        if self.repository_membership.is_none()
+            && self.module_graph_json.is_none()
             && self.dependency_fingerprint.is_none()
             && self.partial.is_none()
             && self.tree.is_none()
@@ -499,6 +553,13 @@ impl HashFileData {
             return Value::Object(hashes);
         }
         let mut metadata = Map::new();
+        if let Some(membership) = &self.repository_membership {
+            metadata.insert(
+                "repositoryMembership".to_owned(),
+                serde_json::to_value(membership)
+                    .expect("serializing repository membership cannot fail"),
+            );
+        }
         if let Some(module_graph_json) = &self.module_graph_json {
             metadata.insert(
                 "moduleGraphJson".to_owned(),
@@ -544,6 +605,105 @@ pub struct ImpactedTargetWithDistance {
     pub label: String,
     pub target_distance: usize,
     pub package_distance: usize,
+}
+
+/// Describes the evidence available in the ordinary head graph. A potential or
+/// unknown row remains a candidate, including when its tail disappeared from the
+/// head. An independent graph path does not guarantee a configured product edit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepositoryEvidence {
+    IndependentPath,
+    MembershipPath,
+    Unknown,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryImpact {
+    #[serde(flatten)]
+    pub impact: ImpactedTargetWithDistance,
+    pub repository_evidence: RepositoryEvidence,
+}
+
+/// Annotates the ordinary impact result without changing its labels, ordering or
+/// distances. A real path takes precedence when another route uses a fallback.
+pub fn repository_impact_evidence(
+    before: &HashFileData,
+    after: &HashFileData,
+    edges: &BTreeMap<String, Vec<String>>,
+    impacts: Vec<ImpactedTargetWithDistance>,
+) -> Vec<RepositoryImpact> {
+    let Some(coverage) = after
+        .repository_membership
+        .as_ref()
+        .filter(|c| c.groups.is_some() && c.supported(&after.hashes))
+        .filter(|_| {
+            before
+                .repository_membership
+                .as_ref()
+                .is_some_and(|c| c.supported(&before.hashes))
+        })
+    else {
+        return impacts
+            .into_iter()
+            .map(|impact| RepositoryImpact {
+                impact,
+                repository_evidence: RepositoryEvidence::Unknown,
+            })
+            .collect();
+    };
+    let changes = impacted_types(&before.hashes, &after.hashes);
+    let mut independent = HashSet::new();
+    let mut potential = HashSet::new();
+    let mut parents = HashMap::<&str, Vec<(&str, bool)>>::new();
+    let mut queue = VecDeque::new();
+    for (label, kind) in &changes {
+        if *kind == ImpactType::Direct {
+            independent.insert(label.as_str());
+            queue.push_back((label.as_str(), true));
+            continue;
+        }
+        let membership = coverage.members(label);
+        for child in edges
+            .get(label)
+            .into_iter()
+            .flatten()
+            .filter(|c| changes.contains_key(*c))
+        {
+            let inferred = membership.binary_search(child).is_ok();
+            parents.entry(child).or_default().push((label, inferred));
+        }
+    }
+    while let Some((child, clean)) = queue.pop_front() {
+        for &(parent, inferred) in parents.get(child).into_iter().flatten() {
+            let clean = clean && !inferred;
+            let seen = if clean {
+                &mut independent
+            } else {
+                &mut potential
+            };
+            if seen.insert(parent) {
+                queue.push_back((parent, clean));
+            }
+        }
+    }
+    impacts
+        .into_iter()
+        .map(|impact| {
+            let repository_evidence = if independent.contains(impact.label.as_str()) {
+                RepositoryEvidence::IndependentPath
+            } else if potential.contains(impact.label.as_str()) {
+                RepositoryEvidence::MembershipPath
+            } else {
+                RepositoryEvidence::Unknown
+            };
+            RepositoryImpact {
+                impact,
+                repository_evidence,
+            }
+        })
+        .collect()
 }
 
 fn kind_rank(hash: Option<&TargetHash>) -> u8 {
@@ -814,6 +974,83 @@ mod tests {
             hash: hash.into(),
             direct_hash: direct.into(),
         }
+    }
+
+    #[test]
+    fn reported_membership_never_overrides_an_independent_path() {
+        let mut from = HashFileData::default();
+        let mut to = HashFileData::default();
+        for label in ["//:file", "//external:hub", "//:through_hub", "//:both"] {
+            from.hashes
+                .insert(label.into(), target("Rule", "before", "old"));
+            let direct = if label == "//:file" { "new" } else { "old" };
+            to.hashes
+                .insert(label.into(), target("Rule", "after", direct));
+        }
+        let edges = BTreeMap::from([
+            ("//external:hub".into(), vec!["//:file".into()]),
+            ("//:through_hub".into(), vec!["//external:hub".into()]),
+            (
+                "//:both".into(),
+                vec!["//:file".into(), "//external:hub".into()],
+            ),
+        ]);
+        from.hashes
+            .insert("//:removed".into(), target("Rule", "before", "old"));
+        to.hashes
+            .insert("//:added".into(), target("Rule", "after", "new"));
+        from.hashes
+            .insert("//:old_path".into(), target("Rule", "before", "same"));
+        to.hashes
+            .insert("//:old_path".into(), target("Rule", "after", "same"));
+        let distances =
+            impacted_targets_with_distances(&from.hashes, &to.hashes, &edges, None, false).unwrap();
+        assert!(
+            repository_impact_evidence(&from, &to, &edges, distances.clone())
+                .iter()
+                .all(|r| r.repository_evidence == RepositoryEvidence::Unknown)
+        );
+        let coverage = RepositoryMembership {
+            groups: Some(BTreeMap::from([("group".into(), vec!["//:file".into()])])),
+            inputs: BTreeMap::from([("//external:hub".into(), "group".into())]),
+            ..Default::default()
+        };
+        from.repository_membership = Some(RepositoryMembership::default());
+        assert_eq!(
+            from.to_value(true, false)["metadata"]["repositoryMembership"],
+            serde_json::json!({"version":1})
+        );
+        to.repository_membership = Some(coverage);
+        let bytes = serde_json::to_vec(&to.serialized(true, false)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            to.to_value(true, false)
+        );
+        let round_tripped = HashFileData::from_slice(&bytes).unwrap();
+        let rows = repository_impact_evidence(&from, &round_tripped, &edges, distances);
+        let evidence: BTreeMap<_, _> = rows
+            .into_iter()
+            .map(|row| (row.impact.label, row.repository_evidence))
+            .collect();
+        assert_eq!(
+            evidence["//:through_hub"],
+            RepositoryEvidence::MembershipPath
+        );
+        assert_eq!(evidence["//:both"], RepositoryEvidence::IndependentPath);
+        assert_eq!(evidence["//:file"], RepositoryEvidence::IndependentPath);
+        assert_eq!(evidence["//:added"], RepositoryEvidence::IndependentPath);
+        assert_eq!(evidence["//:old_path"], RepositoryEvidence::Unknown);
+        assert!(!evidence.contains_key("//:removed"));
+        let mut incomplete = round_tripped.repository_membership.unwrap();
+        incomplete
+            .inputs
+            .insert("//:missing_parent".into(), "group".into());
+        assert!(!incomplete.supported(&to.hashes));
+        incomplete.inputs.remove("//:missing_parent");
+        incomplete
+            .inputs
+            .insert("//external:hub".into(), "missing_group".into());
+        assert!(!incomplete.supported(&to.hashes));
     }
 
     #[test]

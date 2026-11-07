@@ -1391,6 +1391,78 @@ fn isolated_dependency_root_keeps_hidden_spoke_changes() {
 }
 
 #[test]
+fn report_repository_membership_distinguishes_source_edits() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("ext/tools.bzl"), |source| {
+        source.replace(
+            r#"    app(name = "app")"#,
+            r#"    app(name = "app")
+    tc(name = versions.get("spare", "first"), version = "same")"#,
+        )
+    });
+    edit(&root.join("BUILD.bazel"), |source| {
+        format!(
+            r#"{source}
+genrule(name = "product", srcs = [":uses_app", "data.txt"], outs = ["product.txt"],
+        cmd = "cat $(location :uses_app) $(location :data.txt) > $@")
+"#
+        )
+    });
+    fs::write(root.join("data.txt"), "A").unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let base = out.path().join("base.json");
+    let head = out.path().join("head.json");
+    let edges = out.path().join("edges.json");
+    let impacts = out.path().join("impacts.json");
+    let fine = "--fineGrainedHashExternalRepos=@app";
+    assert_product(root, "//:product", "product.txt", "1.0A");
+    assert!(generate(root, &base, &[fine]).status.success());
+    fs::write(
+        root.join("versions.json"),
+        r#"{"toolchain":"1.0","spare":"second"}"#,
+    )
+    .unwrap();
+
+    for (data, product, evidence) in [
+        ("A", "1.0A", "membershipPath"),
+        ("B", "1.0B", "independentPath"),
+    ] {
+        fs::write(root.join("data.txt"), data).unwrap();
+        assert_product(root, "//:product", "product.txt", product);
+        assert!(
+            generate(root, &head, &[fine, "-d", edges.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(impacted(
+            root,
+            &base,
+            &head,
+            &impacts,
+            &[
+                "-d",
+                edges.to_str().unwrap(),
+                "--reportRepositoryMembership"
+            ]
+        )
+        .status
+        .success());
+        let changes: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&impacts).unwrap()).unwrap();
+        let row = changes
+            .iter()
+            .find(|row| matches!(row["label"].as_str(), Some("//:product" | "@@//:product")))
+            .unwrap();
+        assert_eq!(row["repositoryEvidence"], evidence);
+    }
+}
+
+#[test]
 fn toolchain_declarations_follow_their_implementations() {
     let workspace = copy_workspace("extension_toolchain_through_owner");
     let root = workspace.path();

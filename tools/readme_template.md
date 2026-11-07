@@ -164,6 +164,26 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
+### Repository membership in ordinary Bzlmod queries
+
+A loading-phase query can omit the selected toolchain or the library behind a generated hub.
+To keep those changes reachable, an extension's owning module covers its generated repositories,
+and each imported hub covers unimported siblings. A membership change affects the repository's
+transitive hash. Its direct hash records changes to its definition and ordinary inputs.
+
+Add `--reportRepositoryMembership` to the distance command above to return a
+`repositoryEvidence` field with each result.
+
+* `independentPath` means the final graph has a path to a directly changed input through
+  ordinary dependencies.
+* `membershipPath` means the observed paths to a directly changed input pass through inferred
+  membership. A genuine toolchain user can fall into this category.
+* `unknown` means the artifacts cannot establish either path, for example when an input
+  disappeared or a hash file predates membership reporting.
+
+The base needs only its hashes. Generate the final hashes and dependency edges together, as in
+the example above. A caller can verify uncertain targets in their actual build configurations.
+
 ## Explaining Why a Target Was Impacted
 
 `get-impacted-targets` tells you *that* `//service/a:app` needs rebuilding. It does not tell you

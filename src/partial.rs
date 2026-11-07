@@ -44,7 +44,7 @@ type DigestBytes = [u8; 32];
 
 /// Bumped when the recipe format or the evaluation formula changes, so an entry an older
 /// release wrote is regenerated rather than evaluated under a formula it was not recorded for.
-pub const RECIPE_VERSION: u32 = 13;
+pub const RECIPE_VERSION: u32 = 14;
 
 // ---------------------------------------------------------------------------------------------
 // Git tree index
@@ -731,6 +731,7 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
     let hashes = evaluate(recipes, &targets, tree)?;
     Ok(HashFileData {
         hashes,
+        repository_membership: base.repository_membership.clone(),
         module_graph_json: base.module_graph_json.clone(),
         dependency_fingerprint: base.dependency_fingerprint.clone(),
         dep_edges: base.dep_edges.clone(),
@@ -1421,6 +1422,14 @@ mod tests {
 
         // Derivation uses the recipes themselves, without requiring emitted dependency edges.
         let base = HashFileData {
+            repository_membership: Some(crate::model::RepositoryMembership {
+                groups: Some(BTreeMap::from([(
+                    "fixture".into(),
+                    vec!["//pkg:lib".into()],
+                )])),
+                inputs: BTreeMap::from([("//pkg:bin".into(), "fixture".into())]),
+                ..Default::default()
+            }),
             hashes: before,
             partial: Some(recipes),
             ..Default::default()
@@ -1428,6 +1437,11 @@ mod tests {
         let derived = derive(&base, &edited).unwrap();
         assert_eq!(derived.hashes, after);
         assert_eq!(derived.partial, base.partial);
+        let reloaded = HashFileData::from_slice(
+            &serde_json::to_vec(&derived.serialized(true, false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.repository_membership, base.repository_membership);
         assert!(derived.dep_edges.is_empty());
     }
 
@@ -1475,6 +1489,7 @@ mod tests {
         let targets = targets();
         let mut base = HashFileData {
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
+            repository_membership: None,
             module_graph_json: Some("{}".into()),
             dependency_fingerprint: Some("fp".into()),
             dep_edges: BTreeMap::from([("//pkg:bin".to_owned(), vec!["//pkg:lib".to_owned()])]),

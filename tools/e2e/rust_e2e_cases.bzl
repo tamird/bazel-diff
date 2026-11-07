@@ -180,6 +180,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::report_repository_membership_distinguishes_source_edits",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::returned_external_source_reaches_consumer",
                 "timeout": "moderate",
             },

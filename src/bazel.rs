@@ -2816,7 +2816,8 @@ fn chunk_arguments(arguments: &[String], budget: usize) -> Vec<&[String]> {
 pub(crate) type RepositoryInputs = Arc<RepositoryInputGroup>;
 
 pub(crate) struct RepositoryInputGroup {
-    pub(crate) extension: String,
+    /// Reusable across repositories when all anchors see exactly this member set.
+    pub(crate) identity: Option<String>,
     pub(crate) labels: Vec<String>,
 }
 
@@ -2830,7 +2831,9 @@ fn materialize_repository_inputs_for_batch(batch: &mut [Target], inputs: Option<
 
 fn materialize_repository_inputs(target: &mut Target, shared: Option<RepositoryInputs>) {
     if let Some(inputs) = shared {
-        target.rule.as_option_mut().unwrap().rule_input = inputs.labels.clone();
+        let plain = &mut target.rule.as_option_mut().unwrap().rule_input;
+        plain.extend(inputs.labels.iter().cloned());
+        plain.sort_unstable();
     }
 }
 
@@ -2932,7 +2935,6 @@ fn lower_repositories(
 
     let mut targets = Vec::new();
     let mut shared_groups = HashMap::<String, RepositoryInputs>::new();
-    let empty = BTreeSet::new();
     for (index, mut repository) in repositories.into_iter().enumerate() {
         let canonical = repository.canonical_name.as_deref().unwrap_or_default();
         let extension = extension_usage_prefix(canonical);
@@ -2941,26 +2943,24 @@ fn lower_repositories(
             .map(|(_module_repo, definition_hash)| definition_hash.as_str());
         let module = (canonical.matches('+').count() == 1)
             .then(|| canonical.split('+').next().unwrap_or(canonical));
-        let mut dependencies = module
+        let dependencies = module
             .into_iter()
             .flat_map(|module| module_edges.get(module).into_iter().flatten())
             .filter_map(|dependency| module_to_canonical.get(dependency))
             .flat_map(|canonical| node_names(canonical))
             .collect::<BTreeSet<_>>();
-        if let Some(repos) = module_extension_repos.get(canonical) {
-            dependencies.extend(repos.iter().cloned());
-        }
-        let spokes = extension
-            .filter(|_| extension_edges.is_some_and(|imported| imported.contains(canonical)))
-            .and_then(|extension| extension_spokes.get_key_value(extension));
-        let group = if dependencies.is_empty() {
-            spokes
-        } else {
-            if let Some((_, names)) = spokes {
-                dependencies.extend(names.iter().cloned());
-            }
-            None
-        };
+        // Owners are module repositories; hubs are generated repositories.
+        let inferred = module_extension_repos
+            .get(canonical)
+            .map(|members| (format!("owner:{canonical}"), members))
+            .or_else(|| {
+                let usage = extension.filter(|_| {
+                    extension_edges.is_some_and(|imported| imported.contains(canonical))
+                })?;
+                extension_spokes
+                    .get(usage)
+                    .map(|members| (format!("hub:{usage}"), members))
+            });
         let names = node_names(canonical);
         if names.is_empty() {
             continue;
@@ -2972,27 +2972,38 @@ fn lower_repositories(
         // All apparent names have the same definition. Move it into the final output.
         let mut rules = std::iter::repeat_n(rule, names.len());
         for apparent in names {
-            // Imported hubs of one extension share its ordered hidden siblings. Pass
-            // the same allocation to the hash traversal when no owner-specific edge
-            // needs adding or removing. Raw query callers expand it into the protobuf.
-            let (inputs, shared) = match group {
-                Some((extension, names)) if !names.contains(&apparent) => {
-                    let shared = shared_groups.entry(extension.clone()).or_insert_with(|| {
+            let group = inferred.as_ref().and_then(|(id, members)| {
+                if members.contains(&apparent) || !dependencies.is_disjoint(members) {
+                    // A genuine edge to the same repository retains its ordinary meaning.
+                    let labels: Vec<_> = members
+                        .difference(&dependencies)
+                        .filter(|member| *member != &apparent)
+                        .map(|member| format!("//external:{member}"))
+                        .collect();
+                    return (!labels.is_empty()).then(|| {
                         Arc::new(RepositoryInputGroup {
-                            extension: extension.clone(),
-                            labels: names
-                                .iter()
-                                .map(|name| format!("//external:{name}"))
-                                .collect(),
+                            identity: None,
+                            labels,
                         })
                     });
-                    (&empty, Some(Arc::clone(shared)))
                 }
-                Some((_, names)) => (names, None),
-                None => (&dependencies, None),
-            };
-            let mut target = repository_target(rules.next().unwrap(), &apparent, inputs);
-            transform(&mut target, shared);
+                if members.is_empty() {
+                    return None;
+                }
+                Some(Arc::clone(shared_groups.entry(id.clone()).or_insert_with(
+                    || {
+                        Arc::new(RepositoryInputGroup {
+                            identity: Some(id.clone()),
+                            labels: members
+                                .iter()
+                                .map(|member| format!("//external:{member}"))
+                                .collect(),
+                        })
+                    },
+                )))
+            });
+            let mut target = repository_target(rules.next().unwrap(), &apparent, &dependencies);
+            transform(&mut target, group);
             targets.push(target);
         }
     }
@@ -6077,6 +6088,36 @@ exit 1
             &mut materialize_repository_inputs,
         );
         assert_eq!(query.len(), 8);
+
+        // If two canonical identities lower to the same emitted spelling, the
+        // real module edge must remain ordinary even if the owner also infers it.
+        let overlap = parse_repo_mapping(
+            r#"{"rules_go":"rules_go+","rules_go++go_sdk+go_default_sdk":"rules_rs+"}"#,
+        );
+        let mut saw_owner = false;
+        lower_repositories(
+            repositories(),
+            &overlap,
+            &edges,
+            Some(&imported),
+            &LabelOnlyRepositories::default(),
+            Path::new("."),
+            &mut |target, group| {
+                if target_name(target) == Some("//external:rules_go") {
+                    let rule = target.rule.as_option().unwrap();
+                    assert_eq!(
+                        rule.rule_input,
+                        ["//external:rules_go++go_sdk+go_default_sdk"]
+                    );
+                    assert_eq!(
+                        group.unwrap().labels,
+                        ["//external:rules_go++go_sdk+go_toolchains"]
+                    );
+                    saw_owner = true;
+                }
+            },
+        );
+        assert!(saw_owner);
         // The owning module reaches everything its extensions generate, after its module deps.
         assert_eq!(
             inputs_of(&query, "//external:rules_go"),

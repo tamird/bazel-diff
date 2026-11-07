@@ -214,6 +214,7 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     let mut definition_digests = PreparedRules::default();
     let mut digests = Vec::new();
     let query_started = Instant::now();
+    let mut inferred_parents = Vec::new();
     let QueriedTargets {
         targets,
         module_graph_json,
@@ -221,6 +222,13 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         scoped_sources,
         output_base,
     } = options.bazel.query_all_targets_with(|batch, inputs| {
+        if inputs.is_some() && options.track_deps {
+            inferred_parents.extend(
+                batch
+                    .iter()
+                    .filter_map(|target| target.rule.as_option().map(|rule| rule.name.clone())),
+            );
+        }
         let prehash = |target: &mut Target, shared_inputs| {
             let rule = target.rule.as_option_mut()?;
             // Read before `prehash_rule` drops the attributes they come from.
@@ -249,7 +257,30 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
     // The query is the phase worth cancelling; a request abandoned during it stops here instead
     // of hashing targets nobody will read.
     options.bazel.check_cancelled()?;
-    let (data, mut timings) = hash_targets_with_digests(
+    let mut membership = crate::model::RepositoryMembership {
+        groups: (options.track_deps && !options.bazel.use_cquery).then(BTreeMap::new),
+        ..Default::default()
+    };
+    if let Some(groups) = &mut membership.groups {
+        for parent in inferred_parents {
+            // The final prehash wins if query inputs contained a duplicate label.
+            let prepared = definition_digests
+                .ids
+                .get(&parent)
+                .and_then(|id| definition_digests.prepared[*id].as_ref());
+            if let Some(group) = prepared.and_then(|p| p.shared_inputs.as_ref()) {
+                let id = group
+                    .identity
+                    .clone()
+                    .unwrap_or_else(|| format!("target:{parent}"));
+                groups
+                    .entry(id.clone())
+                    .or_insert_with(|| group.labels.clone());
+                membership.inputs.insert(parent, id);
+            }
+        }
+    }
+    let (mut data, mut timings) = hash_targets_with_digests(
         options,
         targets,
         definition_digests,
@@ -258,10 +289,16 @@ pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, Gen
         scoped_sources,
         output_base,
     )?;
+    if !options.bazel.use_cquery && data.module_graph_json.is_some() {
+        data.repository_membership = Some(membership);
+    }
     timings.bazel_query_millis = bazel_query_millis;
     Ok((data, timings))
 }
 
+/// Hashes the supplied flat target data. Repository membership provenance is
+/// available through [`generate_hashes`], where lowering can distinguish
+/// inferred coverage from ordinary inputs before either is materialized.
 pub fn hash_targets(options: &HashOptions, targets: Vec<Target>) -> Result<HashFileData> {
     options.bazel.check_raw_targets_supported()?;
     hash_targets_with_digests(
@@ -685,6 +722,7 @@ fn hash_targets_with_environment(
         partial = Some(recipes);
     }
     Ok(HashFileData {
+        repository_membership: None,
         hashes,
         module_graph_json,
         dependency_fingerprint: None,
@@ -969,7 +1007,7 @@ struct HashContext<'a> {
     /// since most graphs never need it, and never for a plain query, where every key is a
     /// bare label and resolves directly.
     label_instances: Option<HashMap<String, Vec<String>>>,
-    repository_input_digests: HashMap<String, (Vec<u8>, Sha256)>,
+    repository_input_digests: HashMap<String, Sha256>,
     seed_hash: DigestBytes,
     package_bzl_seeds: BTreeMap<String, DigestBytes>,
     bzl_digests: HashMap<String, Option<(String, DigestBytes)>>,
@@ -986,13 +1024,12 @@ impl HashContext<'_> {
         builder: &mut TargetDigestBuilder,
     ) -> bool {
         use std::collections::hash_map::Entry;
-        let (labels, transitive) = match self
-            .repository_input_digests
-            .entry(inputs.extension.clone())
-        {
+        let Some(id) = &inputs.identity else {
+            return false;
+        };
+        let transitive = match self.repository_input_digests.entry(id.clone()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let mut labels = Vec::new();
                 let mut transitive = Sha256::new();
                 for label in &inputs.labels {
                     // An unfinished rule may enter a cycle; let the normal traversal decide
@@ -1005,15 +1042,13 @@ impl HashContext<'_> {
                     else {
                         return false;
                     };
-                    labels.extend_from_slice(label.as_bytes());
                     transitive.update(digest.overall);
                 }
-                entry.insert((labels, transitive))
+                entry.insert(transitive)
             }
         };
         // Each hub has its own direct prefix. Its ordered child digests form the
         // entire transitive prefix; visibility edges, if present, are appended later.
-        builder.direct(labels);
         builder.overall = transitive.clone();
         if builder.track_deps {
             builder.deps.clone_from(&inputs.labels);
@@ -1088,7 +1123,7 @@ impl HashContext<'_> {
             builder.direct(self.always_affected_seed);
         }
 
-        let mut inputs: Vec<Cow<'_, str>> = if rule.input_positions.is_some() {
+        let inputs: Vec<Cow<'_, str>> = if rule.input_positions.is_some() {
             rule.rule
                 .rule_input
                 .iter()
@@ -1121,22 +1156,28 @@ impl HashContext<'_> {
                 canonical_repo_nodes,
             )
         };
-        if let Some(group) = &rule.prepared.shared_inputs {
-            if !self.apply_repository_inputs(group, &mut builder) {
-                inputs.extend(
-                    group
-                        .labels
-                        .iter()
-                        .map(|input| Cow::Borrowed(input.as_str())),
-                );
+        // A returned repository rule's digest includes its own name. Following the
+        // inferred edges preserves conservative membership and content changes in
+        // the overall hash without claiming the parent's definition changed.
+        let members = rule
+            .prepared
+            .shared_inputs
+            .as_ref()
+            .filter(|group| !self.apply_repository_inputs(group, &mut builder))
+            .map_or(&[][..], |group| group.labels.as_slice());
+        let inferred_inputs = members
+            .iter()
+            .map(|name| (Cow::Borrowed(name.as_str()), None));
+        let ordinary_inputs = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, input)| (input, Some(index)));
+        for (encoded_input, position) in inferred_inputs.chain(ordinary_inputs) {
+            let input_slot = position
+                .and_then(|index| rule.input_positions.as_ref()?.get(index).copied().flatten());
+            if position.is_some() {
+                builder.direct(encoded_input.as_bytes());
             }
-        }
-        for (position, encoded_input) in inputs.into_iter().enumerate() {
-            let input_slot = rule
-                .input_positions
-                .as_ref()
-                .and_then(|ids| ids.get(position).copied().flatten());
-            builder.direct(encoded_input.as_bytes());
             let input_label = target_label(&encoded_input);
             match self.resolve_input(&encoded_input, input_label, input_slot, path) {
                 Some(Input::Source(digest)) => builder.source(input_label, digest),
@@ -4109,10 +4150,10 @@ esac
         let workspace = tempfile::tempdir().unwrap();
         let options = hash_options(workspace.path());
         let group = Arc::new(RepositoryInputGroup {
-            extension: "+tools".into(),
+            identity: Some("hub:+tools".into()),
             labels: vec!["//external:a".into(), "//external:z".into()],
         });
-        let mut targets: Vec<_> = ["a", "hub1", "hub2", "hub3", "z"]
+        let targets: Vec<_> = ["a", "hub1", "hub2", "hub3", "z"]
             .into_iter()
             .map(|name| {
                 let inputs = match name {
@@ -4128,32 +4169,113 @@ esac
                 })
             })
             .collect();
-        let expected = hash_targets_for_test(&options, targets.clone(), workspace.path()).unwrap();
-        let mut prepared = PreparedRules::default();
-        for target in &mut targets {
-            let rule = target.rule.as_option_mut().unwrap();
-            if rule.rule_input == group.labels {
-                rule.rule_input.clear();
-                prepared.extend([(
-                    rule.name.clone(),
-                    PreparedRule {
-                        definition_digest: prehash_rule(rule, &options.ignored_attributes),
-                        shared_inputs: Some(Arc::clone(&group)),
-                        loading_inputs: Vec::new(),
-                    },
-                )]);
+        let hash_group = |mut targets: Vec<Target>, group: RepositoryInputs| {
+            let mut prepared = PreparedRules::default();
+            for target in &mut targets {
+                let rule = target.rule.as_option_mut().unwrap();
+                if rule.rule_input == group.labels {
+                    rule.rule_input.clear();
+                    prepared.extend([(
+                        rule.name.clone(),
+                        PreparedRule {
+                            definition_digest: prehash_rule(rule, &options.ignored_attributes),
+                            shared_inputs: Some(Arc::clone(&group)),
+                            loading_inputs: Vec::new(),
+                        },
+                    )]);
+                }
             }
-        }
-        let actual = hash_targets_with_environment(
-            &options,
-            targets,
-            prepared,
-            ExternalRepoResolver::default(),
-            None,
-        )
-        .unwrap();
+            hash_targets_with_environment(
+                &options,
+                targets,
+                prepared,
+                ExternalRepoResolver::default(),
+                None,
+            )
+            .unwrap()
+        };
+        let expected = hash_group(
+            targets.clone(),
+            Arc::new(RepositoryInputGroup {
+                identity: None,
+                labels: group.labels.clone(),
+            }),
+        );
+        let actual = hash_group(targets, group);
         assert_eq!(actual.hashes, expected.hashes);
         assert_eq!(actual.dep_edges, expected.dep_edges);
+    }
+
+    #[test]
+    fn repository_membership_is_transitive_even_for_equal_content_siblings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tree = Arc::new(TreeIndex::parse_ls_tree(b""));
+        for partial in [false, true] {
+            let mut options = hash_options(workspace.path());
+            options.partial_tree = partial.then(|| Arc::clone(&tree));
+            let snapshot = |name: &str, binding: &str| {
+                let rule = |label: &str| Rule {
+                    name: label.to_owned(),
+                    rule_class: "repo".into(),
+                    ..Default::default()
+                };
+                let mut owner = rule("//external:owner");
+                owner.rule_input = vec![binding.into()];
+                let group = Arc::new(RepositoryInputGroup {
+                    identity: Some("hub:extension".into()),
+                    labels: vec![name.into()],
+                });
+                let mut prepared = PreparedRules::default();
+                prepared.extend([(
+                    owner.name.clone(),
+                    PreparedRule {
+                        definition_digest: prehash_rule(&mut owner, &options.ignored_attributes),
+                        loading_inputs: Vec::new(),
+                        shared_inputs: Some(group),
+                    },
+                )]);
+                let targets = [
+                    owner,
+                    rule("//external:left"),
+                    rule("//external:right"),
+                    rule("//external:ordinary"),
+                ]
+                .into_iter()
+                .map(rule_target)
+                .collect();
+                hash_targets_with_environment(
+                    &options,
+                    targets,
+                    prepared,
+                    ExternalRepoResolver::default(),
+                    None,
+                )
+                .unwrap()
+            };
+            let before = snapshot("//external:left", "//external:ordinary");
+            let membership = snapshot("//external:right", "//external:ordinary");
+            let binding = snapshot("//external:right", "//external:left");
+            let owner = "//external:owner";
+            assert_eq!(
+                before.hashes[owner].direct_hash,
+                membership.hashes[owner].direct_hash
+            );
+            assert_ne!(before.hashes[owner].hash, membership.hashes[owner].hash);
+            assert_ne!(
+                membership.hashes[owner].direct_hash,
+                binding.hashes[owner].direct_hash
+            );
+            assert_ne!(
+                before.hashes["//external:left"].hash,
+                before.hashes["//external:right"].hash
+            );
+            if partial {
+                assert_eq!(
+                    partial::derive(&membership, &tree).unwrap().hashes,
+                    membership.hashes
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -255,6 +255,10 @@ struct GetImpactedTargetsArgs {
     #[arg(short = 'd', long = "depEdgesFile")]
     dep_edges_file: Option<PathBuf>,
 
+    /// Report whether each changed label has a path independent of inferred repository membership.
+    #[arg(long = "reportRepositoryMembership", requires = "dep_edges_file")]
+    report_repository_membership: bool,
+
     #[arg(long = "targetType", value_delimiter = ',')]
     target_type: Vec<String>,
 
@@ -768,6 +772,9 @@ fn fingerprint_flags(
     {
         flags.insert("fineAliasInputs".into(), "4".into());
     }
+    if !args.use_cquery {
+        flags.insert("repositoryMembership".into(), "1".into());
+    }
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());
     }
@@ -1020,13 +1027,20 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
             }
             Cow::Owned(distance_from)
         };
-        serde_json::to_string(&impacted_targets_with_distances(
+        let distances = impacted_targets_with_distances(
             &distance_from,
             &to.hashes,
             &dep_edges,
             target_types.as_ref(),
             exclude_external,
-        )?)?
+        )?;
+        if args.report_repository_membership {
+            serde_json::to_string(&bazel_diff::model::repository_impact_evidence(
+                &from, &to, &dep_edges, distances,
+            ))?
+        } else {
+            serde_json::to_string(&distances)?
+        }
     } else {
         let impacted = impacted_with_module_changes(&from, &to, Some(&bazel))?;
         filter_and_sort_labels(
@@ -2358,6 +2372,7 @@ mod tests {
         )
         .unwrap();
         let base_args = || GetImpactedTargetsArgs {
+            report_repository_membership: false,
             starting_hashes: from_path.clone(),
             final_hashes: to_path.clone(),
             dep_edges_file: None,
@@ -2855,6 +2870,7 @@ mod tests {
         .unwrap();
         let error = run_get_impacted(
             &GetImpactedTargetsArgs {
+                report_repository_membership: false,
                 starting_hashes: from.clone(),
                 final_hashes: to.clone(),
                 dep_edges_file: Some(deps.clone()),
