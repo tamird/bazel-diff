@@ -730,6 +730,7 @@ pub fn derive(base: &HashFileData, tree: &TreeIndex) -> Result<HashFileData> {
         .collect();
     let hashes = evaluate(recipes, &targets, tree)?;
     Ok(HashFileData {
+        configured_roots: None,
         hashes,
         repository_membership: base.repository_membership.clone(),
         module_graph_json: base.module_graph_json.clone(),
@@ -1488,6 +1489,7 @@ mod tests {
         let recipes = recipes();
         let targets = targets();
         let mut base = HashFileData {
+            configured_roots: None,
             hashes: evaluate(&recipes, &targets, &fixture_tree()).unwrap(),
             repository_membership: None,
             module_graph_json: Some("{}".into()),
