@@ -1202,7 +1202,13 @@ impl BazelOptions {
                 result.hash_labels.insert(id.into_owned(), name.to_owned());
             }
             if let Some(readers) = &mut result.readers {
-                for ty in target_inputs(row).filter_map(|v| spellings.get(v)) {
+                for ty in row
+                    .rule
+                    .as_option()
+                    .into_iter()
+                    .flat_map(|r| &r.rule_input)
+                    .filter_map(|v| spellings.get(v))
+                {
                     if let Some(members) = readers.get_mut(*ty) {
                         members.push(name.to_owned());
                     }

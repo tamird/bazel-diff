@@ -200,6 +200,14 @@ root can also have an ordinary or configured path. For those path kinds, `direct
 records the origins used by native distance calculation, including its existing
 distance-zero fallback for an incomplete dependency file.
 
+## Possible toolchain readers
+
+For ordinary queries, pass `--includeToolchainInputs` to a fresh `generate-hashes` at both revisions and request `--depEdgesFile` at the final revision. The hash file records the native toolchain declarations the query returned. Shallow metadata reads recover their implementation and type attributes and follow literal type aliases already in the query result. Partial derivation cannot establish these supplemental observations and omits the index. The head file also preserves references to those types before external inputs are mapped to repository nodes.
+
+Pass the head edge file and `--toolchainCandidatesFile=possible.json` to `get-impacted-targets`. Its usual impact output retains its existing format. The additional file lists `possibleTypes`, `possibleReaders`, and unresolved observations. A type belongs in the result when its observed declaration bindings or the associated hashes differ or cannot be compared. A change to the recorded module graph also makes the observed types possible. A reader can reference a type as ordinary data, and its configured build may stay unchanged.
+
+These observations supplement an existing selection. The file reports `complete: false` even when `unresolved` is empty. Bazel versions differ in which implicit type dependencies they emit, and a registration priority change can switch the selected compiler while every observed target hash stays equal. Absence from this file cannot exclude a job.
+
 ## Partial Graph Updates
 
 A full `generate-hashes` pays for a `bazel query` over the whole graph even when the change
@@ -903,6 +911,8 @@ Options:
           A hash file written with --partialGraph to derive this revision's hashes from, when the diff between its tree and the workspace's allows it; otherwise a full generation runs
       --gitPath <GIT_PATH>
           Path to the git executable --partialGraph reads the workspace's tree with [default: git]
+      --includeToolchainInputs
+          Preserve observed native declaration bindings and, with -d, ordinary type references
       --verifyConfiguredRoots
           Verify configured hash input coverage using a fresh full dependency query
   -h, --help
@@ -945,6 +955,8 @@ Options:
           [default: false] [possible values: true, false]
       --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
           [possible values: true, false]
+      --toolchainCandidatesFile <TOOLCHAIN_CANDIDATES_FILE>
+          Write positive toolchain reader observations. Absence cannot exclude a scheduled target
   -h, --help
           Print help
   -V, --version

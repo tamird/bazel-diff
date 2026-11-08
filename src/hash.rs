@@ -280,7 +280,7 @@ fn generate_hashes_timed_inner(
     let mut digests = Vec::new();
     let query_started = Instant::now();
     let mut inferred_parents = Vec::new();
-    let mut prepare = |batch: &mut [Target], inputs| {
+    let mut prepare = |batch: &mut [Target], inputs: Option<RepositoryInputs>| {
         if inputs.is_some() && options.track_deps {
             inferred_parents.extend(
                 batch
@@ -4892,6 +4892,7 @@ esac
                     targets,
                     prepared,
                     ExternalRepoResolver::default(),
+                    None,
                     None,
                     None,
                 )

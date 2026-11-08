@@ -48,7 +48,10 @@ enum Commands {
         #[command(flatten)]
         args: GenerateHashesArgs,
         /// Preserve observed native declaration bindings and, with -d, ordinary type references.
-        #[arg(long = "includeToolchainInputs", conflicts_with = "verify_configured_roots")]
+        #[arg(
+            long = "includeToolchainInputs",
+            conflicts_with = "verify_configured_roots"
+        )]
         include_toolchain_inputs: bool,
         /// Verify configured hash input coverage using a fresh full dependency query.
         #[arg(long = "verifyConfiguredRoots")]
@@ -269,9 +272,6 @@ struct GenerateHashesArgs {
 
 #[derive(Debug, Args)]
 struct GetImpactedTargetsArgs {
-    /// Write positive toolchain reader observations. Absence cannot exclude a scheduled target.
-    #[arg(long = "toolchainCandidatesFile", requires = "dep_edges_file")]
-    toolchain_candidates_file: Option<PathBuf>,
     #[arg(long = "startingHashes")]
     starting_hashes: PathBuf,
 
@@ -327,6 +327,10 @@ struct GetImpactedTargetsArgs {
         default_missing_value = "true"
     )]
     exclude_external_targets: Option<bool>,
+
+    /// Write positive toolchain reader observations. Absence cannot exclude a scheduled target.
+    #[arg(long = "toolchainCandidatesFile", requires = "dep_edges_file")]
+    toolchain_candidates_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1449,29 +1453,27 @@ fn run() -> Result<()> {
             args,
             include_toolchain_inputs,
             verify_configured_roots,
-        } => {
-            match (*include_toolchain_inputs, *verify_configured_roots) {
-                (true, false) => {
-                    if args.partial_graph || args.hashing.use_cquery {
-                        bail!("--includeToolchainInputs requires fresh ordinary generation");
-                    }
-                    run_generate_with(
-                        args,
-                        cli.verbose,
-                        bazel_diff::hash::generate_hashes_with_toolchain_inputs,
-                    )?;
+        } => match (*include_toolchain_inputs, *verify_configured_roots) {
+            (true, false) => {
+                if args.partial_graph || args.hashing.use_cquery {
+                    bail!("--includeToolchainInputs requires fresh ordinary generation");
                 }
-                (false, true) => {
-                    run_generate_verified(args, cli.verbose)?;
-                }
-                (false, false) => {
-                    run_generate(args, cli.verbose)?;
-                }
-                (true, true) => {
-                    bail!("--includeToolchainInputs and --verifyConfiguredRoots cannot be combined");
-                }
+                run_generate_with(
+                    args,
+                    cli.verbose,
+                    bazel_diff::hash::generate_hashes_with_toolchain_inputs,
+                )?;
             }
-        }
+            (false, true) => {
+                run_generate_verified(args, cli.verbose)?;
+            }
+            (false, false) => {
+                run_generate(args, cli.verbose)?;
+            }
+            (true, true) => {
+                bail!("--includeToolchainInputs and --verifyConfiguredRoots cannot be combined");
+            }
+        },
         Commands::GetImpactedTargets(args) => run_get_impacted(args, cli.verbose)?,
         Commands::Explain(args) => run_explain(args, cli.verbose)?,
         Commands::Fingerprint(args) => run_fingerprint(args)?,
