@@ -2806,6 +2806,18 @@ impl SourceHasher<'_> {
         Ok(())
     }
 
+    /// The host may contain only part of a repository tree. Read a directory through a
+    /// canonical external source label only when its contents live in the source workspace.
+    fn workspace_source_directory(&self, path: &Path) -> Option<PathBuf> {
+        let directory = fs::canonicalize(path).ok()?;
+        let workspace = fs::canonicalize(self.workspace).ok()?;
+        let output_base = fs::canonicalize(&self.external_resolver.output_base).ok()?;
+        (directory.starts_with(workspace)
+            && !directory.starts_with(&output_base)
+            && !output_base.starts_with(&directory))
+        .then_some(directory)
+    }
+
     fn resolve(
         &self,
         label: &str,
@@ -2866,6 +2878,23 @@ impl SourceHasher<'_> {
                         match fs::metadata(&path) {
                             Ok(metadata) if metadata.is_file() => {
                                 return Ok(Some((path, key.to_string_lossy().into_owned(), true)));
+                            }
+                            // The workspace directory view applies only to full canonical cquery
+                            // sources; ordinary and partial alias reads use the resolver below.
+                            Ok(metadata)
+                                if metadata.is_dir()
+                                    && configured_source
+                                    && canonical
+                                    && self.tree.is_none()
+                                    && self.content_hashes.is_none() =>
+                            {
+                                if let Some(directory) = self.workspace_source_directory(&path) {
+                                    return Ok(Some((
+                                        directory,
+                                        key.to_string_lossy().into_owned(),
+                                        false,
+                                    )));
+                                }
                             }
                             Ok(_) => {}
                             Err(e)
@@ -3900,6 +3929,15 @@ esac
         // Neither name listed: the label is opaque, as before.
         assert!(hasher(&["other"]).resolve(label, false).unwrap().is_none());
         assert!(hasher(&[]).resolve(label, false).unwrap().is_none());
+        // A partially populated repository directory is still opaque, even with the
+        // output base inside the workspace.
+        let headers = repo_root.join("headers");
+        fs::create_dir(&headers).unwrap();
+        fs::write(headers.join("one.h"), "one").unwrap();
+        assert!(hasher(&[])
+            .resolve("@@rules_jvm_external++maven+maven//:headers", true)
+            .unwrap()
+            .is_none());
         // An apparent label, as `query` prints it, resolves under the canonical name too.
         let (path, _, _) = hasher(&["rules_jvm_external++maven+maven"])
             .resolve("@maven//:guava.jar", false)
@@ -3912,6 +3950,11 @@ esac
             .is_none());
         #[cfg(unix)]
         {
+            std::os::unix::fs::symlink(workspace.path(), repo_root.join("source_root")).unwrap();
+            assert!(hasher(&[])
+                .resolve("@@rules_jvm_external++maven+maven//:source_root", true)
+                .unwrap()
+                .is_none());
             let loop_path = repo_root.join("loop");
             std::os::unix::fs::symlink("loop", &loop_path).unwrap();
             let label = "@@rules_jvm_external++maven+maven//:loop";

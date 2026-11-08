@@ -828,6 +828,9 @@ fn fingerprint_flags(
         flags.insert("cqueryRootExpression".into(), expr);
         flags.insert("configuredRoots".into(), "1".into());
     }
+    if args.use_cquery {
+        flags.insert("cqueryWorkspaceDirectories".into(), "1".into());
+    }
     if let Some(root) = &args.isolated_dependency_root {
         flags.insert("isolatedDependencyRoot".into(), root.clone());
     }
