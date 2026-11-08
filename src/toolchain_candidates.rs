@@ -125,15 +125,15 @@ pub fn add_returned_readers(
             .insert("head reader observation unavailable".into());
         return;
     };
-    let types: BTreeSet<_> = report.possible_types.iter().collect();
-    if types.is_empty() {
+    if report.possible_types.is_empty() {
         return;
     }
     report.unresolved.extend(
-        types
+        report
+            .possible_types
             .iter()
-            .filter(|ty| !index.contains_key(**ty))
-            .map(|ty| (*ty).clone()),
+            .filter(|ty| !index.contains_key(*ty))
+            .cloned(),
     );
     let mut queue: VecDeque<_> = report
         .possible_types
