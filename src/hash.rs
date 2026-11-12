@@ -1,3 +1,4 @@
+use crate::bazel::ConfiguredVerification;
 use crate::bazel::{
     encode_configured_input, encoded_rule_attributes, split_configured, target_label, target_name,
     AliasSource, BazelOptions, EncodedAttribute, EncodedTargets, FilegroupWitness, QueriedTargets,
@@ -240,7 +241,7 @@ pub fn generate_hashes(options: &HashOptions) -> Result<HashFileData> {
 }
 
 pub fn generate_hashes_timed(options: &HashOptions) -> Result<(HashFileData, GenerationTimings)> {
-    generate_hashes_timed_inner(options, false, false)
+    generate_hashes_timed_inner(options, None, false)
 }
 
 /// Retains supplemental loading-phase facts while generating a fresh ordinary graph.
@@ -248,13 +249,24 @@ pub fn generate_hashes_with_toolchain_inputs(options: &HashOptions) -> Result<Ha
     if options.bazel.use_cquery || options.partial_tree.is_some() {
         anyhow::bail!("--includeToolchainInputs requires fresh ordinary generation");
     }
-    generate_hashes_timed_inner(options, false, true).map(|(file, _)| file)
+    generate_hashes_timed_inner(options, None, true).map(|(file, _)| file)
 }
 
 /// Captures a fresh configured graph to verify normal input coverage and retain the additional
 /// context needed for a stable comparison. Historical, partial, or caller-overridden source
 /// hashes cannot establish this coverage.
 pub fn generate_verified_hashes(options: &HashOptions) -> Result<HashFileData> {
+    verified_hashes(options, ConfiguredVerification::Query)
+}
+
+pub fn generate_build_hashes(options: &HashOptions) -> Result<HashFileData> {
+    verified_hashes(options, ConfiguredVerification::Build)
+}
+
+fn verified_hashes(
+    options: &HashOptions,
+    verification: ConfiguredVerification,
+) -> Result<HashFileData> {
     if options.content_hashes.is_some()
         || !options.modified_filepaths.is_empty()
         || options.partial_tree.is_some()
@@ -266,12 +278,12 @@ pub fn generate_verified_hashes(options: &HashOptions) -> Result<HashFileData> {
             "--verifyConfiguredRoots requires full physical hashes without ignored attributes or excluded targets"
         );
     }
-    generate_hashes_timed_inner(options, true, false).map(|(data, _)| data)
+    generate_hashes_timed_inner(options, Some(verification), false).map(|(data, _)| data)
 }
 
 fn generate_hashes_timed_inner(
     options: &HashOptions,
-    verify: bool,
+    verify: Option<ConfiguredVerification>,
     include_toolchain_inputs: bool,
 ) -> Result<(HashFileData, GenerationTimings)> {
     if options.bazel.isolated_dependency_root.is_some()
@@ -329,10 +341,12 @@ fn generate_hashes_timed_inner(
             definition_digests.extend(digests.drain(..).flatten());
         }
     };
-    let queried = if verify {
+    let queried = if let Some(verification) = verify {
         options
             .bazel
-            .query_all_targets_verified_with(|batch, inputs| prepare(batch, &[], inputs, None))?
+            .query_all_targets_verified_with(verification, |batch, inputs| {
+                prepare(batch, &[], inputs, None)
+            })?
     } else {
         options.bazel.query_all_targets_encoded(
             true,

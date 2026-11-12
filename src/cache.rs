@@ -28,6 +28,31 @@ pub fn configuration_fingerprint(
     let mut hasher = Sha256::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update([0]);
+    // A name-only --repo_env passes the Bazel client's environment through to repository
+    // rules. Two clients using the same spelling can materialize different repositories.
+    for options in [
+        &options.bazel.command_options,
+        &options.bazel.cquery_options,
+    ] {
+        let mut options = options.iter();
+        while let Some(arg) = options.next() {
+            let setting = if arg == "--repo_env" {
+                options.next().map(String::as_str)
+            } else {
+                arg.strip_prefix("--repo_env=")
+            };
+            if let Some(name) = setting.filter(|s| !s.is_empty() && !s.contains('=')) {
+                hasher.update(b"inherited repo_env\0");
+                hasher.update(name.as_bytes());
+                hasher.update([0]);
+                if let Some(value) = std::env::var_os(name) {
+                    hasher.update([1]);
+                    hasher.update(value.as_encoded_bytes());
+                }
+                hasher.update([0]);
+            }
+        }
+    }
     for value in [
         options.bazel.startup_options.join("\0"),
         options.bazel.command_options.join("\0"),

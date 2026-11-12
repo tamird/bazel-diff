@@ -1,3 +1,4 @@
+mod build_invocation;
 mod toolchain_readers;
 use crate::cancel::{self, Cancellation};
 use crate::proto::analysis::{
@@ -37,6 +38,12 @@ pub(crate) struct ServerInfo {
     /// Whether `//external` exists. `None` when it cannot be told from `bazel info` alone, which
     /// keeps the query probing for it.
     external_package: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfiguredVerification {
+    Query,
+    Build,
 }
 
 #[derive(Clone, Debug)]
@@ -445,13 +452,14 @@ impl BazelOptions {
                 keep_going: false,
                 ..self.clone()
             }
-            .query_all_targets_inner(transform, false, lean, physical_sources);
+            .query_all_targets_inner(transform, None, lean, physical_sources);
         }
-        self.query_all_targets_inner(transform, false, lean, physical_sources)
+        self.query_all_targets_inner(transform, None, lean, physical_sources)
     }
 
     pub(crate) fn query_all_targets_verified_with(
         &self,
+        verify: ConfiguredVerification,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
         if !self.use_cquery
@@ -467,7 +475,7 @@ impl BazelOptions {
         // Verification is a cquery; nothing it decodes is lean.
         .query_all_targets_inner(
             |batch, _, inputs, _ordinary_inputs| transform(batch, inputs),
-            true,
+            Some(verify),
             false,
             false,
         )
@@ -481,7 +489,7 @@ impl BazelOptions {
             Option<RepositoryInputs>,
             Option<Vec<String>>,
         ),
-        verify: bool,
+        verify: Option<ConfiguredVerification>,
         lean: bool,
         physical_sources: bool,
     ) -> Result<QueriedTargets> {
@@ -574,7 +582,13 @@ impl BazelOptions {
             Vec::new()
         } else {
             definitions.take().map_or_else(Vec::new, |mut defs| {
-                defs.lower(self, &canonical_to_apparent, |row| {
+                defs.lower(self, &canonical_to_apparent, |mut row| {
+                    // A configured dependency traversal contains the target's library and
+                    // toolchain inputs. Sibling repositories emitted by the same extension
+                    // are a conservative stand-in only when we cannot observe that invocation.
+                    if verify == Some(ConfiguredVerification::Build) {
+                        row.memberships.clear();
+                    }
                     row.finish(&BTreeSet::new(), &mut |target, inputs, ordinary| {
                         transform(std::slice::from_mut(target), &[], inputs, ordinary);
                     })
@@ -610,7 +624,7 @@ impl BazelOptions {
                                 transform(batch, &[], None, None);
                             },
                         )
-                    } else if verify && use_cquery {
+                    } else if verify.is_some() && use_cquery {
                         // Keep positive distances on the caller's normal view. The full typed
                         // view below qualifies coverage without adding positive impact paths.
                         let targets =

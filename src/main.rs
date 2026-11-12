@@ -271,6 +271,11 @@ struct GenerateHashesArgs {
     #[arg(long = "gitPath", default_value = "git")]
     git_path: PathBuf,
 
+    /// JSON Build Event Protocol file from the build or test whose configured roots are being
+    /// hashed. Relative paths are resolved in the Bazel workspace.
+    #[arg(long = "buildEventJson")]
+    build_invocation: Option<PathBuf>,
+
     output_path: Option<PathBuf>,
 }
 
@@ -889,13 +894,26 @@ fn run_generate_with(
         args.dep_edges_file.is_some(),
         verbose,
     )?;
-    let mut data = if args.partial_graph {
+    let invocation = args
+        .build_invocation
+        .as_ref()
+        .map(|path| options.bazel.bind_build_invocation(path))
+        .transpose()?;
+    let mut data = if invocation.is_some() {
+        if args.partial_graph || args.base_hashes.is_some() {
+            bail!("--buildEventJson requires a fresh configured traversal");
+        }
+        bazel_diff::hash::generate_build_hashes(&options)?
+    } else if args.partial_graph {
         partial_graph_hashes(args, &mut options, generate)?
     } else if args.base_hashes.is_some() {
         bail!("--baseHashes needs --partialGraph");
     } else {
         generate(&options)?
     };
+    if let Some(invocation) = invocation {
+        invocation.check_roots(data.configured_roots.as_ref())?;
+    }
     if !args.target_type.is_empty() {
         let types = args.target_type.iter().cloned().collect::<HashSet<_>>();
         data.hashes.retain(|_, hash| types.contains(&hash.kind));
@@ -1231,6 +1249,7 @@ fn run_warmup_with(
         partial_graph_rebuild_patterns: args.generate.partial_graph_rebuild_patterns.clone(),
         base_hashes: args.generate.base_hashes.clone(),
         git_path: args.generate.git_path.clone(),
+        build_invocation: None,
         output_path: Some(args.base_hashes.clone()),
     };
     generate.output_path = Some(args.base_hashes.clone());
@@ -2431,6 +2450,7 @@ mod tests {
                 partial_graph_rebuild_patterns: Vec::new(),
                 base_hashes: None,
                 git_path: PathBuf::from("git"),
+                build_invocation: None,
                 output_path: Some(output.clone()),
             },
             false,
@@ -2678,6 +2698,7 @@ mod tests {
                 partial_graph_rebuild_patterns: Vec::new(),
                 base_hashes: None,
                 git_path: PathBuf::from("git"),
+                build_invocation: None,
                 output_path: None,
             },
             base_hashes: workspace.path().join("nested/base.json"),
@@ -2740,6 +2761,7 @@ mod tests {
             partial_graph_rebuild_patterns: Vec::new(),
             base_hashes: None,
             git_path: PathBuf::from("git"),
+            build_invocation: None,
             output_path: Some(output.to_path_buf()),
         }
     }

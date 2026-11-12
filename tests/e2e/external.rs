@@ -2033,11 +2033,30 @@ toolchain(name = "extra", toolchain = ":impl", toolchain_type = "@ext//:toolchai
 "#,
         )
         .unwrap();
+        fs::write(root.join("transition.bzl"), r#"
+def _prefer(_, attr):
+    return {"//command_line_option:extra_toolchains": [str(attr.registration)]}
+
+prefer = transition(implementation = _prefer, inputs = [], outputs = ["//command_line_option:extra_toolchains"])
+
+def _forward(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".txt")
+    ctx.actions.symlink(output = out, target_file = ctx.file.child)
+    return [DefaultInfo(files = depset([out]))]
+
+forward = rule(implementation = _forward, attrs = {
+    "child": attr.label(allow_single_file = True, cfg = prefer),
+    "registration": attr.label(),
+    "_allowlist_function_transition": attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist"),
+})
+"#).unwrap();
         edit(&root.join("BUILD.bazel"), |build| {
             format!(
-                r#"{build}
+                r#"load(":transition.bzl", "forward")
+{build}
 genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "cat $< > $@")
 filegroup(name = "unrelated", srcs = ["@app//:copies"])
+forward(name = "transitioned", child = ":uses_app", registration = "@outside//:extra")
 "#
             )
         });
@@ -2075,17 +2094,74 @@ filegroup(name = "unrelated", srcs = ["@app//:copies"])
 
     // Both invocations build the same target. The first reads the changed
     // compiler; the second uses the unchanged one from MODULE.bazel.
+    let build_events = |workspace: &std::path::Path, options: &[&str]| {
+        let output = std::process::Command::new(bazel())
+            .current_dir(workspace)
+            .arg("build")
+            .args(options)
+            .args([
+                "--build_event_json_file=job.bep.json",
+                "//:product",
+                "//:transitioned",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for workspace in [&first, &changed] {
+        build_events(workspace.path(), &[]);
+    }
     let scoped = [
         "--fineGrainedHashExternalRepos=@app",
         "--useCquery",
-        "--cqueryRootExpression=//:product",
+        "--cqueryRootExpression=set(//:product //:transitioned)",
+        "--buildEventJson=job.bep.json",
     ];
-    let alternate = diff_local(first.path(), changed.path(), &scoped);
-    for workspace in [&first, &changed] {
+    let report = || {
+        let base = out.path().join("base.json");
+        let head = out.path().join("head.json");
+        let result = out.path().join("comparison.json");
+        let mut args = scoped.to_vec();
+        args.extend(["-d", edges.to_str().unwrap()]);
+        for (workspace, path) in [(&first, &base), (&changed, &head)] {
+            let generation = generate(workspace.path(), path, &args);
+            assert!(
+                generation.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generation.stderr)
+            );
+        }
+        let comparison = impacted(
+            changed.path(),
+            &base,
+            &head,
+            &result,
+            &["-d", edges.to_str().unwrap(), "--reportImpactGraph"],
+        );
+        assert!(
+            comparison.status.success(),
+            "{}",
+            String::from_utf8_lossy(&comparison.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&fs::read(result).unwrap()).unwrap()
+    };
+    let alternate = report();
+    for (workspace, version) in [(&first, "one"), (&changed, "two")] {
         fs::write(workspace.path().join(".bazelrc"), "").unwrap();
         assert_product(workspace.path(), "//:product", "product.txt", "1.0");
+        assert_product(
+            workspace.path(),
+            "//:transitioned",
+            "transitioned.txt",
+            version,
+        );
+        build_events(workspace.path(), &[]);
     }
-    let registered = diff_local(first.path(), changed.path(), &scoped);
+    let registered = report();
     let ordinary = diff_local(
         first.path(),
         changed.path(),
@@ -2094,46 +2170,69 @@ filegroup(name = "unrelated", srcs = ["@app//:copies"])
     for (workspace, version) in [(&first, "one"), (&changed, "two")] {
         let root = workspace.path();
         edit(&root.join("ext/tools.bzl"), |extension| {
-            extension.replace("version = versions[\"toolchain\"]", "version = versions[\"alternate\"] if mctx.getenv(\"BAZEL_DIFF_ALTERNATE\") == \"yes\" else versions[\"toolchain\"]")
+            extension.replace("def _tools_impl(mctx):", "def _tools_impl(mctx):\n    if mctx.getenv('BAZEL_DIFF_ALTERNATE') == 'wrong-mod-context':\n        fail('mod did not use the build repository environment')").replace("version = versions[\"toolchain\"]", "version = versions[\"alternate\"] if mctx.getenv(\"BAZEL_DIFF_ALTERNATE\") == \"yes\" else versions[\"toolchain\"]")
         });
-        fs::write(root.join(".bazelrc"), "build --repo_env=BAZEL_DIFF_ALTERNATE=yes\ncquery --repo_env=BAZEL_DIFF_ALTERNATE=no\n").unwrap();
+        fs::write(root.join(".bazelrc"), "build --repo_env=BAZEL_DIFF_ALTERNATE=yes\ncquery --repo_env=BAZEL_DIFF_ALTERNATE=no\nmod --repo_env=BAZEL_DIFF_ALTERNATE=wrong-mod-context\n").unwrap();
         assert_product(root, "//:product", "product.txt", version);
+        let wrong = std::process::Command::new(bazel())
+            .current_dir(root)
+            .args(["mod", "show_repo", "@@ext++tools+tc"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&wrong.stderr)
+            .contains("mod did not use the build repository environment"));
     }
-    let conflicting = diff_local(first.path(), changed.path(), &scoped);
-    let overlay = |value: &str| {
-        let query = format!("--bazelCommandOptions=--repo_env=BAZEL_DIFF_ALTERNATE={value}");
-        let cquery = format!("--cqueryCommandOptions=--repo_env=BAZEL_DIFF_ALTERNATE={value}");
-        let mut args = scoped.to_vec();
-        args.extend([query.as_str(), cquery.as_str()]);
-        diff_local(first.path(), changed.path(), &args)
-    };
-    let same_yes = overlay("yes");
-    let same_no = overlay("no");
+    for workspace in [&first, &changed] {
+        build_events(workspace.path(), &[]);
+    }
+    let same_yes = report();
+    for workspace in [&first, &changed] {
+        build_events(workspace.path(), &["--repo_env=BAZEL_DIFF_ALTERNATE=no"]);
+    }
+    let same_no = report();
     if let Some(artifacts) = std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR") {
-        let results = serde_json::json!({ "flag": alternate, "module": registered, "ordinary": ordinary, "conflicting": conflicting, "same_yes": same_yes, "same_no": same_no });
+        let results = serde_json::json!({ "flag": alternate, "module": registered, "ordinary": ordinary, "same_yes": same_yes, "same_no": same_no });
         fs::write(
             std::path::Path::new(&artifacts).join("results.json"),
             results.to_string(),
         )
         .unwrap();
     }
-    let selected = |changes: &BTreeSet<String>| {
-        changes
-            .iter()
-            .any(|label| label.trim_start_matches('@') == "//:product")
-    };
-    assert!(
-        selected(&alternate) && !selected(&registered),
-        "flag-selected {alternate:?}, MODULE-selected {registered:?}"
-    );
-    assert!(
-        selected(&same_yes) && !selected(&same_no),
-        "same yes {same_yes:?}, same no {same_no:?}"
-    );
-    assert!(
-        selected(&conflicting),
-        "build changed one to two but the cquery saw {conflicting:?}"
-    );
+    for comparison in [&alternate, &same_yes] {
+        assert!(
+            comparison["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |target| target["label"].as_str().unwrap().trim_start_matches('@')
+                        == "//:product"
+                ),
+            "{comparison}"
+        );
+    }
+    for comparison in [&registered, &same_no] {
+        assert!(
+            comparison["unaffectedRoots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label.as_str().unwrap().trim_start_matches('@') == "//:product"),
+            "{comparison}"
+        );
+        assert!(
+            comparison["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |target| target["label"].as_str().unwrap().trim_start_matches('@')
+                        == "//:transitioned"
+                ),
+            "{comparison}"
+        );
+    }
+    assert!(ordinary.contains("//:product"), "{ordinary:?}");
 }
 
 #[test]
