@@ -2072,6 +2072,68 @@ filegroup(name = "unrelated", srcs = ["@app//:copies"])
         // Keep positive MODULE compiler edges alongside the repository fallback.
         assert!(dep_edges(&edges)["@app//:lib"].contains("@@ext++tools+tc//:impl"));
     }
+
+    // Both invocations build the same target. The first reads the changed
+    // compiler; the second uses the unchanged one from MODULE.bazel.
+    let scoped = [
+        "--fineGrainedHashExternalRepos=@app",
+        "--useCquery",
+        "--cqueryRootExpression=//:product",
+    ];
+    let alternate = diff_local(first.path(), changed.path(), &scoped);
+    for workspace in [&first, &changed] {
+        fs::write(workspace.path().join(".bazelrc"), "").unwrap();
+        assert_product(workspace.path(), "//:product", "product.txt", "1.0");
+    }
+    let registered = diff_local(first.path(), changed.path(), &scoped);
+    let ordinary = diff_local(
+        first.path(),
+        changed.path(),
+        &["--fineGrainedHashExternalRepos=@app"],
+    );
+    for (workspace, version) in [(&first, "one"), (&changed, "two")] {
+        let root = workspace.path();
+        edit(&root.join("ext/tools.bzl"), |extension| {
+            extension.replace("version = versions[\"toolchain\"]", "version = versions[\"alternate\"] if mctx.getenv(\"BAZEL_DIFF_ALTERNATE\") == \"yes\" else versions[\"toolchain\"]")
+        });
+        fs::write(root.join(".bazelrc"), "build --repo_env=BAZEL_DIFF_ALTERNATE=yes\ncquery --repo_env=BAZEL_DIFF_ALTERNATE=no\n").unwrap();
+        assert_product(root, "//:product", "product.txt", version);
+    }
+    let conflicting = diff_local(first.path(), changed.path(), &scoped);
+    let overlay = |value: &str| {
+        let query = format!("--bazelCommandOptions=--repo_env=BAZEL_DIFF_ALTERNATE={value}");
+        let cquery = format!("--cqueryCommandOptions=--repo_env=BAZEL_DIFF_ALTERNATE={value}");
+        let mut args = scoped.to_vec();
+        args.extend([query.as_str(), cquery.as_str()]);
+        diff_local(first.path(), changed.path(), &args)
+    };
+    let same_yes = overlay("yes");
+    let same_no = overlay("no");
+    if let Some(artifacts) = std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR") {
+        let results = serde_json::json!({ "flag": alternate, "module": registered, "ordinary": ordinary, "conflicting": conflicting, "same_yes": same_yes, "same_no": same_no });
+        fs::write(
+            std::path::Path::new(&artifacts).join("results.json"),
+            results.to_string(),
+        )
+        .unwrap();
+    }
+    let selected = |changes: &BTreeSet<String>| {
+        changes
+            .iter()
+            .any(|label| label.trim_start_matches('@') == "//:product")
+    };
+    assert!(
+        selected(&alternate) && !selected(&registered),
+        "flag-selected {alternate:?}, MODULE-selected {registered:?}"
+    );
+    assert!(
+        selected(&same_yes) && !selected(&same_no),
+        "same yes {same_yes:?}, same no {same_no:?}"
+    );
+    assert!(
+        selected(&conflicting),
+        "build changed one to two but the cquery saw {conflicting:?}"
+    );
 }
 
 #[test]
