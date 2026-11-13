@@ -278,7 +278,16 @@ fn filter_occurrences(labels:&BTreeSet<String>, expression:&str) -> Result<Strin
     Ok(format!("filter({pattern}, {expression})"))
 }
 
-fn explicit_target_edges(bytes: &[u8], keys: &HashSet<&str>) -> Option<BTreeMap<String,BTreeSet<String>>> {
+#[derive(Default)]
+struct ExplicitInputs {
+    targets: BTreeSet<String>,
+    definitions: BTreeSet<String>,
+}
+
+/// DOT may print multiple aspect applications with the same description. Retain the
+/// union of their outgoing paths; only unique full target identities are admitted.
+/// A missing real target or unrecognized aspect leaves its parent unresolved.
+fn explicit_target_edges(bytes: &[u8], keys: &HashSet<&str>) -> Option<BTreeMap<String,ExplicitInputs>> {
     let body = std::str::from_utf8(bytes).ok()?.trim().strip_prefix("digraph mygraph {")?.strip_suffix('}')?;
     let mut names = HashMap::new();
     for &key in keys {
@@ -286,21 +295,41 @@ fn explicit_target_edges(bytes: &[u8], keys: &HashSet<&str>) -> Option<BTreeMap<
         let short = match checksum {Some(hash)=>hash.get(..7)?,None=>"null"};
         names.entry(format!("{label} ({short})")).and_modify(|entry| *entry=None).or_insert(Some(key));
     }
-    let mut edges = BTreeMap::<String,BTreeSet<String>>::new();
-    let mut invalid = BTreeSet::new();
+    let mut raw=BTreeMap::<&str,BTreeSet<&str>>::new();
     for line in body.lines().map(str::trim) {
         if line.is_empty() || line=="node [shape=box];" {continue;}
         let row = line.strip_prefix('"')?.strip_suffix('"')?;
         let (parent,child)=row.split_once("\" -> \"").map_or((row,None),|(parent,child)|(parent,Some(child)));
-        let Some(&Some(parent))=names.get(parent) else {continue};
-        let values=edges.entry(parent.to_owned()).or_default();
-        if let Some(child)=child {
-            if let Some(&Some(key))=names.get(child) {values.insert(key.to_owned());}
-            else {invalid.insert(parent);}
-        }
+        let inputs=raw.entry(parent).or_default();
+        if let Some(child)=child {inputs.insert(child);raw.entry(child).or_default();}
     }
-    edges.retain(|parent,_| !invalid.contains(parent.as_str()));
-    Some(edges)
+    let mut result=BTreeMap::new();
+    for (node,direct) in &raw {
+        let Some(Some(key))=names.get(*node) else {continue;};
+        let mut reached=ExplicitInputs::default();
+        let mut pending=direct.iter().copied().collect::<Vec<_>>();
+        let mut visited=HashSet::new();
+        let mut complete=true;
+        while let Some(child)=pending.pop() {
+            if !visited.insert(child) {continue;}
+            if let Some(Some(target))=names.get(child) {
+                reached.targets.insert((*target).to_owned());
+                continue;
+            }
+            let Some((descriptor,base))=child.split_once(" of ") else {complete=false;break;};
+            let Some((source,_))=descriptor.split_once('%') else {complete=false;break;};
+            // A Bazel graph containing only target keys cannot supply an aspect-only
+            // target. Its top-level configured hash cannot stand in for the missing occurrence.
+            let Some(Some(target))=names.get(base) else {complete=false;break;};
+            if !(source.starts_with('@')||source.starts_with("//")) || !source.ends_with(".bzl") {complete=false;break;};
+            let Some(children)=raw.get(child) else {complete=false;break;};
+            reached.targets.insert((*target).to_owned());
+            reached.definitions.insert(source.to_owned());
+            pending.extend(children);
+        }
+        if complete {result.insert((*key).to_owned(),reached);}
+    }
+    Some(result)
 }
 
 // Every path lost by removing a membership has a first removed edge. Compute its
@@ -380,7 +409,7 @@ fn retain_memberships(
 }
 
 impl BazelOptions {
-    fn configured_adjacency(&self, expression:&str, keys:&HashSet<&str>) -> Result<Option<BTreeMap<String,BTreeSet<String>>>> {
+    fn configured_adjacency(&self, expression:&str, keys:&HashSet<&str>) -> Result<Option<BTreeMap<String,ExplicitInputs>>> {
                 let mut explicit = self.command();
                 let query_file = tempfile::NamedTempFile::new()?;
                 std::fs::write(query_file.path(), expression)?;
@@ -637,7 +666,7 @@ impl BazelOptions {
                         }
                         inputs.insert(key);
                     }
-                    if closed && explicit.as_ref().and_then(|graph| graph.get(&rule.name)) == Some(&inputs) {
+                    if closed && explicit.as_ref().and_then(|graph| graph.get(&rule.name)).is_some_and(|observed|observed.definitions.is_empty() && observed.targets==inputs) {
                         let operands = ordinary.rule_input.iter().chain(&extra).cloned().collect();
                         witnessed.entry(ordinary.name.clone()).or_default().push((inputs,operands));
                     } else { unclosed.insert(ordinary.name.clone()); }
@@ -675,10 +704,16 @@ impl BazelOptions {
                     let mut closures = BTreeMap::new();
                     for rule in closure.iter().filter_map(|row|row.rule.as_option()) {
                         let name = graph.canonical(super::target_label(&rule.name));
-                        let inputs=rule.configured_rule_input.iter().map(super::encode_configured_input).collect::<BTreeSet<_>>();
-                        if precise.as_ref().and_then(|edges|edges.get(&rule.name))!=Some(&inputs) {complete=false;}
+                        let mut inputs=rule.configured_rule_input.iter().map(super::encode_configured_input).collect::<BTreeSet<_>>();
+                        let mut definitions=BTreeSet::new();
+                        if let Some(observed)=precise.as_ref().and_then(|edges|edges.get(&rule.name)) {
+                            if !inputs.is_subset(&observed.targets) {complete=false;}
+                            inputs.extend(observed.targets.iter().cloned());
+                            definitions.extend(observed.definitions.iter().cloned());
+                        } else {complete=false;}
                         let Some(base) = ordinary.get(&name).and_then(|row|row.rule.as_option()) else {complete=false;continue;};
-                        let positive = inputs.iter().map(|key|graph.canonical(super::target_label(key))).collect::<BTreeSet<_>>();
+                        let mut positive = inputs.iter().map(|key|graph.canonical(super::target_label(key))).collect::<BTreeSet<_>>();
+                        positive.extend(definitions);
                         result.bindings.entry(base.name.clone()).or_default().push(Arc::new(positive.clone()));
                         let operands = base.rule_input.iter().chain(&positive).cloned().collect();
                         closures.entry(base.name.clone()).or_insert_with(Vec::new).push((inputs,operands));

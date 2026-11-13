@@ -2106,6 +2106,15 @@ def _produce(ctx):
 
 produce = rule(implementation = _produce, toolchains = ["@ext//:inner_type"])
 "#));
+        fs::write(root.join("ext/feature.bzl"),r#"def _inspect(target, ctx):
+    return []
+inspect=aspect(implementation=_inspect)
+"#).unwrap();
+        edit(&root.join("ext/defs.bzl"),|s|{
+            let s=format!("load(':feature.bzl','inspect')\n{s}");
+            assert!(s.contains("attr.label(allow_single_file = True)"));
+            s.replace("attr.label(allow_single_file = True)", "attr.label(allow_single_file = True, aspects=[inspect])")
+        });
         edit(&root.join("ext/tools.bzl"), |s| {
             s.replace("data = ctx.read(ctx.attr.source) if ctx.attr.source else ctx.attr.version",
                       "data = ctx.read(ctx.attr.source) if ctx.attr.source else ctx.attr.version\n    nested = ctx.attr.version == 'outer-constant'").replace(
