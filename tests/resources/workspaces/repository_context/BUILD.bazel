@@ -1,0 +1,16 @@
+[
+    genrule(
+        name = name + "_product",
+        srcs = ["@hub//:" + name],
+        outs = [name + ".txt"],
+        cmd = "cat $< > $@",
+    )
+    for name in ["compiler", "metadata", "sibling", "copied"]
+]
+
+genrule(
+    name = "mixed_product",
+    srcs = ["@hub//:compiler", "//relay:version"],
+    outs = ["mixed.txt"],
+    cmd = "cat $(SRCS) > $@",
+)

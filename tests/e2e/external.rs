@@ -2009,6 +2009,192 @@ genrule(name = "normal", srcs = ["@app//:lib"], outs = ["normal.txt"], cmd = "ca
 }
 
 #[test]
+fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
+    if !supports_mod_show_repo() || !cfg!(unix) {
+        return;
+    }
+    let workspace = copy_workspace("repository_context");
+    let root = workspace.path();
+    let output = tempfile::tempdir().unwrap();
+    let overlay = output.path().join("overlay");
+    for directory in [root, overlay.as_path()] {
+        fs::create_dir_all(directory.join("definitions")).unwrap();
+        fs::write(directory.join("definitions/BUILD.bazel"), "").unwrap();
+    }
+    fs::write(root.join(".bazelrc"), format!(
+        "build --package_path={}:%workspace%\nbuild --extra_toolchains=@@ext++tools+tc_impl//:tc\n", overlay.display()
+    )).unwrap();
+    let base = output.path().join("base.json");
+    let edges = output.path().join("edges.json");
+    let result = output.path().join("impacts.json");
+    let products = ["metadata", "compiler", "sibling", "copied", "mixed"];
+    let stock_route = std::env::var_os("BAZEL_DIFF_STOCK_ROUTE").is_some();
+    if stock_route {
+        fs::write(root.join(".bazelrc"), format!("common --package_path={}:%workspace%\nbuild --extra_toolchains=@@ext++tools+tc_impl//:tc\n", overlay.display())).unwrap();
+    }
+    for (state, compiler, sibling, marker, decoy) in [
+        ("base", "first", "one", "selected", "decoy"),
+        ("compiler", "second", "one", "selected", "decoy"),
+        ("sibling", "first", "two", "selected", "decoy"),
+        ("loaded", "first", "one", "updated", "decoy"),
+        ("decoy", "first", "one", "selected", "other"),
+    ] {
+        fs::write(
+            root.join("versions.json"),
+            format!(r#"{{"sibling":"{sibling}"}}"#),
+        )
+        .unwrap();
+        fs::write(root.join("compiler-input.txt"), compiler).unwrap();
+        for (directory, value) in [(root, decoy), (overlay.as_path(), marker)] {
+            fs::write(
+                directory.join("definitions/marker.bzl"),
+                format!("MARKER = {value:?}\n"),
+            )
+            .unwrap();
+        }
+        let built = std::process::Command::new(bazel())
+            .current_dir(root)
+            .args(["build", "--build_event_json_file=job.bep.json"])
+            .args(products.map(|name| format!("//:{name}_product")))
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let mixed = format!("{compiler}{compiler}");
+        for (name, expected) in products
+            .into_iter()
+            .zip([marker, compiler, sibling, sibling, &mixed])
+        {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("bazel-bin/{name}.txt"))).unwrap(),
+                expected
+            );
+        }
+        let snapshot = output.path().join(format!("{state}.json"));
+        let mut args = vec![
+            "--includeTargetType", "--excludeExternalTargets",
+            "--fineGrainedHashExternalRepos=@hub", "--resolveRepositoryInputs=job.bep.json",
+            "--bazelCommandOptions=--curses=no --nokeep_going --proto:output_rule_attrs=tags,deprecation --proto:include_synthetic_attribute_hash --noproto:locations",
+        ];
+        if stock_route {
+            args.retain(|s| !s.starts_with("--resolveRepositoryInputs"));
+            args.extend(["--useCquery", "--cqueryRootExpression=set(//:metadata_product //:compiler_product //:sibling_product //:copied_product //:mixed_product)", "--cqueryCommandOptions=--extra_toolchains=@@ext++tools+tc_impl//:tc"]);
+        }
+        if state != "base" {
+            args.extend(["--depEdgesFile", edges.to_str().unwrap()]);
+        }
+        let generation = generate(root, &snapshot, &args);
+        assert!(
+            generation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generation.stderr)
+        );
+        if state == "base" {
+            continue;
+        }
+        let comparison = impacted(
+            root,
+            &base,
+            &snapshot,
+            &result,
+            &["--depEdgesFile", edges.to_str().unwrap()],
+        );
+        assert!(
+            comparison.status.success(),
+            "{}",
+            String::from_utf8_lossy(&comparison.stderr)
+        );
+        let changes: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        let distances = products.map(|name| {
+            changes
+                .iter()
+                .find(|entry| {
+                    entry["label"].as_str().is_some_and(|label| {
+                        label.trim_start_matches('@') == format!("//:{name}_product")
+                    })
+                })
+                .map(|entry| {
+                    (
+                        entry["targetDistance"].as_u64().unwrap(),
+                        entry["packageDistance"].as_u64().unwrap(),
+                    )
+                })
+        });
+
+        match state {
+            "compiler" => assert_eq!(distances, [None, Some((4, 3)), None, None, Some((2, 2))]),
+            "sibling" => assert_eq!(distances, [None, None, Some((1, 1)), Some((2, 2)), None]),
+            "loaded" => assert!(
+                distances[0].is_some(),
+                "selected cross-package Starlark file: {changes:?}"
+            ),
+            "decoy" => assert_eq!(distances, [None; 5], "unselected package root: {changes:?}"),
+            _ => unreachable!(),
+        }
+    }
+    if stock_route {
+        return;
+    }
+    // The worker can collect its requested roots without running target actions.
+    // A source represented by a symlink needs a Bazel-native loading file receipt.
+    #[cfg(unix)]
+    {
+        let definitions = overlay.join("definitions");
+        fs::rename(
+            definitions.join("marker.bzl"),
+            definitions.join("contents.bzl"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("contents.bzl", definitions.join("marker.bzl")).unwrap();
+        fs::write(
+            definitions.join("BUILD.bazel"),
+            r#"exports_files(["marker.bzl"])"#,
+        )
+        .unwrap();
+        let analysis = std::process::Command::new(bazel())
+            .current_dir(root)
+            .args([
+                "build",
+                "--nobuild",
+                "--build_event_json_file=job.bep.json",
+                "//:metadata_product",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            analysis.status.success(),
+            "{}",
+            String::from_utf8_lossy(&analysis.stderr)
+        );
+        let hashes = output.path().join("analysis.json");
+        let generation = generate(
+            root,
+            &hashes,
+            &[
+                "--verbose",
+                "--excludeExternalTargets",
+                "--fineGrainedHashExternalRepos=@hub",
+                "--resolveRepositoryInputs=job.bep.json",
+            ],
+        );
+        let messages = String::from_utf8_lossy(&generation.stderr);
+        assert!(generation.status.success(), "{messages}");
+        assert!(
+            messages.lines().any(|line| line
+                .strip_prefix("[Info] Bazel reported ")
+                .and_then(|message| message.split_once(' '))
+                .and_then(|(count, _)| count.parse::<usize>().ok())
+                .is_some_and(|count| count > 0)),
+            "{messages}"
+        );
+    }
+}
+
+#[test]
 fn extra_toolchain_outside_the_ordinary_graph_reaches_its_reader() {
     if !supports_mod_show_repo() {
         return;

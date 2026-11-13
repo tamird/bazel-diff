@@ -72,6 +72,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::bzlmod_cc_transitive_deps_query",
                 "timeout": "moderate",
             },
