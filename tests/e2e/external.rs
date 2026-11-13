@@ -2075,8 +2075,10 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
         }
         let snapshot = output.path().join(format!("{state}.json"));
         let mut args = vec![
-            "--includeTargetType", "--excludeExternalTargets",
-            "--fineGrainedHashExternalRepos=@hub", "--resolveRepositoryInputs=job.bep.json",
+            "--includeTargetType",
+            "--excludeExternalTargets",
+            "--fineGrainedHashExternalRepos=@hub",
+            "--resolveRepositoryInputs=job.bep.json",
             "--bazelCommandOptions=--curses=no --nokeep_going --proto:output_rule_attrs=tags,deprecation --proto:include_synthetic_attribute_hash --noproto:locations",
         ];
         if stock_route {
@@ -2201,7 +2203,19 @@ fn build_registration_can_read_an_unrelated_generator_output() {
     }
     let workspace = copy_workspace("extension_toolchain_through_owner");
     let root = workspace.path();
+    edit(&root.join("ext/BUILD.bazel"), |text| {
+        format!(
+            "{text}\nconfig_setting(name = \"enabled\", values = {{\"compilation_mode\": \"fastbuild\"}}, visibility = [\"//visibility:public\"])\n"
+        )
+    });
+    edit(&root.join("ext/defs.bzl"), |text| {
+        text.replace(
+            r#""_wrapper": attr.label(default = "@ext//:wrapper.sh", allow_single_file = True)"#,
+            r#""mode": attr.string()"#,
+        )
+    });
     edit(&root.join("MODULE.bazel"), |text| {
+        let text = text.replace("use_repo(tools, \"app\")", "use_repo(tools, \"hub\")");
         format!(
             r#"{text}
 bazel_dep(name = "outside")
@@ -2213,8 +2227,20 @@ use_repo(data, "asset")
         )
     });
     edit(&root.join("ext/tools.bzl"), |text| {
+        let text = text.replace(
+            "app_lib(name = \"lib\", visibility",
+            r#"app_lib(name = "lib", mode = select({"@ext//:enabled": "yes", "//conditions:default": "no"}), visibility"#,
+        ).replace(
+            "    app(name = \"app\")",
+            "    hub(name = \"hub\")\n    app(name = \"app\")",
+        );
         format!(
             r#"{text}
+def _hub(ctx):
+    ctx.file("BUILD.bazel", 'package(default_visibility = ["//visibility:public"])\nalias(name = "product", actual = ":forward")\nalias(name = "forward", actual = "@app//:lib")')
+
+hub = repository_rule(implementation = _hub)
+
 def _runtime(ctx):
     ctx.file("BUILD.bazel", 'exports_files(["version.txt"])')
     ctx.file("version.txt", ctx.attr.contents)
@@ -2235,9 +2261,13 @@ tool(name = "impl", runtime = "@@ext++data+asset//:version.txt")
 toolchain(name = "extra", toolchain = ":impl", toolchain_type = "@ext//:toolchain_type", visibility = ["//visibility:public"])
 "#).unwrap();
     edit(&root.join("BUILD.bazel"), |text| {
+        let text = text.replace("@app//:lib", "@hub//:product");
         format!(
             r#"{text}
 genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "cat $< > $@")
+alias(name = "direct", actual = ":through")
+alias(name = "through", actual = "@asset//:version.txt")
+genrule(name = "explicit", srcs = [":direct"], outs = ["explicit.txt"], cmd = "cat $< > $@")
 "#
         )
     });
@@ -2258,13 +2288,52 @@ genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "c
             .unwrap();
             let expected = if registered { value } else { "1.0" };
             assert_product(root, "//:product", "product.txt", expected);
+            assert_product(root, "//:explicit", "explicit.txt", value);
+            let configured = out
+                .path()
+                .join(format!("configured-{value}-{registered}.json"));
+            let generated = generate(root, &configured, &[
+                "--useCquery",
+                "--cqueryRootExpression=set(//:product //:explicit)",
+                "--fineGrainedHashExternalRepos=@hub",
+                "--excludeExternalTargets",
+                "--includeTargetType",
+                "--bazelCommandOptions=--curses=no --nokeep_going --proto:output_rule_attrs=bazel_ci_critical_test_targets,deprecated_disable_automatic_selection --proto:include_synthetic_attribute_hash --noproto:locations",
+            ]);
+            assert!(
+                generated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            if value == "two" {
+                let selected = out.path().join("configured-impacts");
+                let before = out.path().join(format!("configured-one-{registered}.json"));
+                let comparison = impacted(root, &before, &configured, &selected, &[]);
+                assert!(
+                    comparison.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&comparison.stderr)
+                );
+                let changes = read_lines(&selected)
+                    .into_iter()
+                    .map(|s| s.trim_start_matches('@').to_owned())
+                    .collect::<BTreeSet<_>>();
+                let mut expected = BTreeSet::from(["//:explicit".to_owned()]);
+                if registered {
+                    expected.insert("//:product".to_owned());
+                }
+                assert_eq!(changes, expected);
+            }
             let hashes = out.path().join(format!("{value}-{registered}.json"));
             let edges = out.path().join(format!("{value}-{registered}-edges.json"));
             assert!(generate(
                 root,
                 &hashes,
                 &[
-                    "--fineGrainedHashExternalRepos=@app",
+                    "--fineGrainedHashExternalRepos=@hub",
+                    "--includeTargetType",
+                    "--excludeExternalTargets",
+                    "--bazelCommandOptions=--curses=no --nokeep_going --proto:output_rule_attrs=bazel_ci_critical_test_targets,deprecated_disable_automatic_selection --proto:include_synthetic_attribute_hash --noproto:locations",
                     "--depEdgesFile",
                     edges.to_str().unwrap()
                 ]
@@ -2276,6 +2345,31 @@ genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "c
             let requested = map.get("//:product").unwrap().clone();
             assert!(!edges.keys().any(|label| label.contains("outside//:extra")));
             assert!(edges["//external:ext"].contains("//external:asset"));
+            let app = edges
+                .iter()
+                .find(|(k, _)| k.ends_with("+app//:lib"))
+                .unwrap();
+            assert!(app.1.contains("@ext//:enabled"), "{app:?}");
+            assert!(app.1.contains("//external:ext"), "{app:?}");
+            let mut visited = BTreeSet::new();
+            let mut pending = vec!["//:product"];
+            while let Some(node) = pending.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                pending.extend(
+                    edges
+                        .get(node)
+                        .into_iter()
+                        .flatten()
+                        .map(String::as_str)
+                        .filter(|input| {
+                            !(*input == "//external:ext"
+                                && (node == app.0 || node == "@ext//:enabled"))
+                        }),
+                );
+            }
+            assert!(!visited.contains("//external:asset"), "{app:?}");
             observations.push((requested, edges));
         }
         // Build-only registration changes analysis, including the selected runtime, while the
