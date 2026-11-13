@@ -76,6 +76,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "external::build_registration_can_read_an_unrelated_generator_output",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::bzlmod_cc_transitive_deps_query",
                 "timeout": "moderate",
             },

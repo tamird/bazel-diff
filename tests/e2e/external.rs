@@ -2195,6 +2195,98 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
 }
 
 #[test]
+fn build_registration_can_read_an_unrelated_generator_output() {
+    if !supports_mod_show_repo() {
+        return;
+    }
+    let workspace = copy_workspace("extension_toolchain_through_owner");
+    let root = workspace.path();
+    edit(&root.join("MODULE.bazel"), |text| {
+        format!(
+            r#"{text}
+bazel_dep(name = "outside")
+local_path_override(module_name = "outside", path = "outside")
+data = use_extension("@ext//:tools.bzl", "data")
+data.lock(file = "//:runtime.txt")
+use_repo(data, "asset")
+"#
+        )
+    });
+    edit(&root.join("ext/tools.bzl"), |text| {
+        format!(
+            r#"{text}
+def _runtime(ctx):
+    ctx.file("BUILD.bazel", 'exports_files(["version.txt"])')
+    ctx.file("version.txt", ctx.attr.contents)
+
+runtime = repository_rule(implementation = _runtime, attrs = {{"contents": attr.string()}})
+
+def _data(ctx):
+    for mod in ctx.modules:
+        for lock in mod.tags.lock:
+            runtime(name = "asset", contents = ctx.read(lock.file))
+
+data = module_extension(implementation = _data, tag_classes = {{"lock": tag_class(attrs = {{"file": attr.label()}})}})
+"#
+        )
+    });
+    fs::write(root.join("outside/BUILD.bazel"),r#"load("@ext//:defs.bzl", "tool")
+tool(name = "impl", runtime = "@@ext++data+asset//:version.txt")
+toolchain(name = "extra", toolchain = ":impl", toolchain_type = "@ext//:toolchain_type", visibility = ["//visibility:public"])
+"#).unwrap();
+    edit(&root.join("BUILD.bazel"), |text| {
+        format!(
+            r#"{text}
+genrule(name = "product", srcs = [":uses_app"], outs = ["product.txt"], cmd = "cat $< > $@")
+"#
+        )
+    });
+    let out = tempfile::tempdir().unwrap();
+    let mut ordinary_by_value = Vec::new();
+    for value in ["one", "two"] {
+        fs::write(root.join("runtime.txt"), value).unwrap();
+        let mut observations = Vec::new();
+        for registered in [false, true] {
+            fs::write(
+                root.join(".bazelrc"),
+                if registered {
+                    "build --extra_toolchains=@outside//:extra\n"
+                } else {
+                    ""
+                },
+            )
+            .unwrap();
+            let expected = if registered { value } else { "1.0" };
+            assert_product(root, "//:product", "product.txt", expected);
+            let hashes = out.path().join(format!("{value}-{registered}.json"));
+            let edges = out.path().join(format!("{value}-{registered}-edges.json"));
+            assert!(generate(
+                root,
+                &hashes,
+                &[
+                    "--fineGrainedHashExternalRepos=@app",
+                    "--depEdgesFile",
+                    edges.to_str().unwrap()
+                ]
+            )
+            .status
+            .success());
+            let map = crate::support::hashes(&hashes);
+            let edges = dep_edges(&edges);
+            let requested = map.get("//:product").unwrap().clone();
+            assert!(!edges.keys().any(|label| label.contains("outside//:extra")));
+            assert!(edges["//external:ext"].contains("//external:asset"));
+            observations.push((requested, edges));
+        }
+        // Build-only registration changes analysis, including the selected runtime, while the
+        // stock ordinary graph for this reader retains the exact same dependency evidence.
+        assert_eq!(observations[0], observations[1]);
+        ordinary_by_value.push(observations.remove(0).0);
+    }
+    assert_ne!(ordinary_by_value[0], ordinary_by_value[1]);
+}
+
+#[test]
 fn extra_toolchain_outside_the_ordinary_graph_reaches_its_reader() {
     if !supports_mod_show_repo() {
         return;
