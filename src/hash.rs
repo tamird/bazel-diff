@@ -830,7 +830,16 @@ fn hash_targets_with_environment(
                 &options.ignored_attributes,
                 &mut qualified,
             );
-            rules.repository_views(&qualified, fine, mapping, &mut hash_targets)
+            let mut views=rules.repository_views(&qualified,fine,mapping,&mut hash_targets);
+            qualified.clear();
+            for (name, operands) in &source_hasher.external_resolver.scoped_sources.scoped_readers {
+                if let Some(&id) = rules.ids.get(name) {
+                    qualified.entry(id).or_default().extend(operands.iter().map(String::as_str));
+                }
+            }
+            let scoped=rules.repository_views_preserving(&qualified,fine,mapping,&mut hash_targets,Some(&source_hasher.external_resolver.scoped_sources.retained_memberships));
+            for (reader,operands) in scoped {views.entry(reader).or_default().extend(operands);}
+            views
         } else {
             RepositoryViews::default()
         };
@@ -1004,6 +1013,29 @@ fn hash_targets_with_environment(
                 })
                 .collect()
         });
+        if !options.bazel.use_cquery {
+            // The ordinary graph uses bare-label nodes. Give each requested root its
+            // exact configured identity, including occurrences which are also inputs
+            // of another requested root. This preserves distances without another edge.
+            let mut public_roots=Vec::new();
+            for (name,kind,digest) in &mut digests {
+                if let Some(configured)=roots.get(name) {public_roots.push((configured.clone(),*kind,digest.clone()));}
+                if roots.contains_key(name) {name.push_str("|ordinary");}
+                if let Some(inputs)=&mut digest.deps {
+                    for input in Rc::make_mut(inputs) {
+                        if roots.contains_key(input) {input.push_str("|ordinary");}
+                    }
+                }
+            }
+            for (_,_,digest) in &mut public_roots {
+                if let Some(inputs)=&mut digest.deps {
+                    for input in Rc::make_mut(inputs) {
+                        if roots.contains_key(input) {input.push_str("|ordinary");}
+                    }
+                }
+            }
+            digests.extend(public_roots);
+        }
         let configured = configured_root_hashes(digests, options.track_deps, &roots)?;
         (
             configured.roots,
@@ -1755,6 +1787,10 @@ impl Labels {
         mapping: &HashMap<String, String>,
         targets: &mut Vec<HashTarget>,
     ) -> RepositoryViews<'a> {
+        self.repository_views_preserving(qualified,fine,mapping,targets,None)
+    }
+
+    fn repository_views_preserving<'a>(&mut self, qualified:&QualifiedInputs<'a>, fine:&BTreeSet<String>, mapping:&HashMap<String,String>, targets:&mut Vec<HashTarget>, retained: Option<&BTreeMap<String,BTreeSet<String>>>) -> RepositoryViews<'a> {
         let mut requested = BTreeMap::<String, Vec<(usize, &str)>>::new();
         for (id, operands) in qualified {
             let Some(node) = self.slots.get(*id).and_then(|slot| slot.rule.as_ref()) else {
@@ -1801,7 +1837,7 @@ impl Labels {
             let roots = requested
                 .into_iter()
                 .filter_map(|(repository, uses)| {
-                    self.plan_repository_definition(&repository, &occupied, &mut states)
+                    self.plan_repository_definition(&repository, &occupied, &mut states,retained.is_some())
                         .then_some((repository, uses))
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -1855,6 +1891,8 @@ impl Labels {
                     },
                 )
                 .collect();
+            let mut inputs:Vec<_>=inputs;
+            if let Some(members)=retained.and_then(|retained|retained.get(&repository)) {inputs.extend(members.iter().cloned());}
             let rule = Rule {
                 name: definition.clone(),
                 rule_class: "repository_definition".into(),
@@ -1890,6 +1928,7 @@ impl Labels {
         repository: &str,
         occupied: &HashSet<&str>,
         states: &mut BTreeMap<String, RepositoryDefinitionState>,
+        scoped: bool,
     ) -> bool {
         match states.entry(repository.to_owned()) {
             BTreeEntry::Vacant(entry) => {
@@ -1912,7 +1951,8 @@ impl Labels {
                 RepositoryDefinitionState::Unavailable;
             false
         };
-        let label = repository_definition_label(repository);
+        let mut label = repository_definition_label(repository);
+        if scoped {label.push_str("/scoped");}
         if occupied.contains(label.as_str()) || self.ids.contains_key(&label) {
             return fail(states);
         }
@@ -1933,7 +1973,7 @@ impl Labels {
         };
         let (definition_digest, inputs) = candidate;
         for input in &inputs {
-            if !self.plan_repository_definition(input, occupied, states) {
+            if !self.plan_repository_definition(input, occupied, states,scoped) {
                 return fail(states);
             }
         }
@@ -2594,7 +2634,7 @@ fn source_seed(source: &SourceTarget) -> DigestBytes {
 }
 
 /// A stack location can omit its column and line; paths can contain colons.
-fn starlark_stack_path(frame: &str) -> &str {
+pub(crate) fn starlark_stack_path(frame: &str) -> &str {
     let mut path = frame.rsplit_once(": ").map_or(frame, |(path, _)| path);
     for _ in 0..2 {
         let Some((prefix, suffix)) = path.rsplit_once(':') else {
@@ -3622,6 +3662,13 @@ impl SourceHasher<'_> {
         label: &str,
         configured_source: bool,
     ) -> Result<Option<(PathBuf, String, bool)>> {
+        let locations = &self.external_resolver.scoped_sources.scoped_locations;
+        if !locations.is_empty() {
+            let name = if is_main_repo(label) { crate::bazel::main_repo_label_key(label).to_owned() } else { self.external_resolver.canonical_source_label(label) };
+            if let Some(path) = locations.get(&name) {
+                return Ok(Some((path.clone(),name,true)));
+            }
+        }
         if let Some(path) = main_repo_path(label) {
             return Ok(Some((
                 path.clone(),

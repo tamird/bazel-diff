@@ -167,7 +167,6 @@ struct HashingArgs {
     /// Hash and report the configured top-level targets in this expression.
     #[arg(
         long = "cqueryRootExpression",
-        requires = "use_cquery",
         conflicts_with = "cquery_expression"
     )]
     cquery_root_expression: Option<String>,
@@ -175,7 +174,6 @@ struct HashingArgs {
     /// Read the configured root expression from this file.
     #[arg(
         long = "cqueryRootExpressionFile",
-        requires = "use_cquery",
         conflicts_with_all = ["cquery_expression", "cquery_root_expression"]
     )]
     cquery_root_expression_file: Option<PathBuf>,

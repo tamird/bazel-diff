@@ -433,8 +433,8 @@ impl BazelOptions {
         ),
     ) -> Result<QueriedTargets> {
         if self.cquery_root_expression.is_some() {
-            if !self.use_cquery {
-                bail!("--cqueryRootExpression requires --useCquery");
+            if !self.use_cquery && (!physical_sources || self.fine_grained_external_repos.is_empty()) {
+                bail!("ordinary scoped repository inputs require fresh fine-grained external repositories");
             }
             if self.cquery_expression.is_some() {
                 bail!("--cqueryRootExpression cannot be combined with --cqueryExpression");
@@ -585,7 +585,8 @@ impl BazelOptions {
             .cquery_root_expression
             .as_deref()
             .map(|expression| self.query_configured_roots(expression, version))
-            .transpose()?;
+            .transpose()?
+            .map(|roots| if self.use_cquery { roots } else { roots.into_iter().map(|(label,key)| (main_repo_label_key(&label).to_owned(),main_repo_label_key(&key).to_owned())).collect() });
         let strict = (!scope.members.is_empty()).then(|| Self {
             keep_going: false,
             ..self.clone()
@@ -744,6 +745,9 @@ impl BazelOptions {
         let mut registration_hashes = BTreeMap::new();
         let mut supplier_hashes = BTreeMap::new();
         let mut toolchain_declarations = BTreeMap::new();
+        let mut scoped_readers = BTreeMap::new();
+        let mut retained_memberships=BTreeMap::new();
+        let mut scoped_locations = BTreeMap::new();
         if let Some(mut defs) = definitions {
             let repos = defs.lower(self, &canonical_to_apparent, std::convert::identity);
             if let Some(mapping) = root_mapping.as_deref() {
@@ -778,6 +782,9 @@ impl BazelOptions {
                         registration_hashes = inputs.registration_hashes;
                         supplier_hashes = inputs.supplier_hashes;
                         toolchain_declarations = inputs.declarations;
+                        scoped_readers = inputs.scoped_readers;
+                        retained_memberships=inputs.retained_memberships;
+                        scoped_locations = inputs.scoped_locations;
                     }
                     Err(error) => {
                         self.check_cancelled()?;
@@ -810,6 +817,9 @@ impl BazelOptions {
             root_mapping,
             output_base: server_info.output_base,
             scoped_sources: ScopedSources {
+                scoped_readers,
+                retained_memberships,
+                scoped_locations,
                 toolchain_declarations,
                 repositories: scope
                     .aliases
@@ -3792,6 +3802,9 @@ fn mod_argument_byte_budget_from(setting: Option<&str>) -> usize {
 
 #[derive(Clone, Default)]
 pub(crate) struct ScopedSources {
+    pub(crate) scoped_readers: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) retained_memberships: BTreeMap<String,BTreeSet<String>>,
+    pub(crate) scoped_locations: BTreeMap<String, PathBuf>,
     /// Positive registration definitions and their forwarding aliases for observed rule types.
     pub(crate) toolchain_declarations: BTreeMap<String, Arc<BTreeSet<String>>>,
     pub(crate) repositories: BTreeSet<String>,

@@ -2015,6 +2015,74 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
     }
     let workspace = copy_workspace("repository_context");
     let root = workspace.path();
+    if std::env::var_os("BAZEL_DIFF_SCOPED_OCCURRENCES").is_some() {
+        fs::create_dir(root.join("definitions")).unwrap();
+        fs::write(root.join("definitions/BUILD.bazel"), r#"exports_files(["marker.bzl"])"#).unwrap();
+        fs::write(root.join("definitions/marker.bzl"), "MARKER = 'mark'\n").unwrap();
+        fs::write(root.join("versions.json"), r#"{"sibling":"one"}"#).unwrap();
+        fs::write(root.join("compiler-input.txt"), "extra").unwrap();
+        fs::write(root.join("switch.bzl"), r#"
+def _switch_impl(_settings, _attr):
+    return {"//command_line_option:extra_toolchains": ["@@ext++tools+tc_impl//:tc"]}
+
+_transition = transition(implementation = _switch_impl, inputs = [], outputs = ["//command_line_option:extra_toolchains"])
+
+def _forward(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".txt")
+    ctx.actions.symlink(output = out, target_file = ctx.files.src[0])
+    return [DefaultInfo(files = depset([out]))]
+
+forward = rule(implementation = _forward, attrs = {
+    "src": attr.label(cfg = _transition),
+    "_allowlist_function_transition": attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist"),
+})
+"#).unwrap();
+        let build = fs::read_to_string(root.join("BUILD.bazel")).unwrap();
+        fs::write(root.join("BUILD.bazel"), format!(r#"load(":switch.bzl", "forward")
+{build}
+forward(name = "switched", src = "@hub//:compiler")
+"#)).unwrap();
+        assert_product(root, "//:compiler_product", "compiler.txt", "default");
+        assert_product(root, "//:switched", "switched.txt", "extra");
+        let label = "@@ext++tools+app//:lib";
+        let query = |scope: &str, expr: &str| {
+            let output = std::process::Command::new(bazel()).current_dir(root).args(["cquery", &format!("--universe_scope={scope}"), expr, "--output=label", "--consistent_labels"]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().lines().map(str::to_owned).collect::<BTreeSet<_>>()
+        };
+        for (scope, expr) in [
+            ("//:compiler_product,//:switched", "set(//:compiler_product //:switched)"),
+            ("//:switched", "set(//:switched)"),
+        ] {
+            let bare = query(scope, &format!("set({label})"));
+            let intersect = query(scope, &format!("deps({expr}) intersect set({label})"));
+            let filtered = query(scope, &format!("filter('ext[+][+]tools[+]app//:lib$', deps({expr}))"));
+            let explicit_target = query(scope, &format!("config(set({label}), target)"));
+            let inputs = query(scope, &format!("deps(deps({expr}) intersect set({label}), 1)"));
+            let load = query(scope, &format!("filter('definitions:marker[.]bzl$', deps(deps({expr}) intersect set({label})))"));
+            assert_eq!(filtered.len(),if scope.contains(',') {2} else {1});
+            eprintln!("OCCURRENCE {scope}: bare={bare:?} intersection={intersect:?} filter={filtered:?} config_target={explicit_target:?} immediate={inputs:?} load={load:?}");
+        }
+        let output=tempfile::tempdir().unwrap();
+        let base=output.path().join("base.json");let head=output.path().join("head.json");let edges=output.path().join("edges.json");
+        let args=["--includeTargetType","--excludeExternalTargets","--fineGrainedHashExternalRepos=@hub","--cqueryRootExpression=set(//:switched)","--cqueryCommandOptions=--universe_scope=//:switched","--depEdgesFile",edges.to_str().unwrap()];
+        let generated=generate(root,&base,&args);assert!(generated.status.success(),"{}",String::from_utf8_lossy(&generated.stderr));
+        fs::write(root.join("compiler-input.txt"),"new compiler").unwrap();
+        assert_product(root,"//:switched","switched.txt","new compiler");
+        let generated=generate(root,&head,&args);assert!(generated.status.success(),"{}",String::from_utf8_lossy(&generated.stderr));
+        let report=output.path().join("report.json");
+        let comparison=impacted(root,&base,&head,&report,&["--depEdgesFile",edges.to_str().unwrap()]);
+        assert!(comparison.status.success(),"{}",String::from_utf8_lossy(&comparison.stderr));
+        assert!(fs::read_to_string(report).unwrap().contains("//:switched"));
+        let loads = std::process::Command::new(bazel()).current_dir(root).args(["query", &format!("buildfiles(set({label}))"), "--output=label", "--consistent_labels"]).output().unwrap();
+        assert!(loads.status.success(), "{}", String::from_utf8_lossy(&loads.stderr));
+        assert!(String::from_utf8_lossy(&loads.stdout).contains("//definitions:marker.bzl"));
+        eprintln!("ENTRANCE loaded .bzl recovered from buildfiles on only the interior reader");
+        assert_product(root, "//:metadata_product", "metadata.txt", "mark");
+        fs::write(root.join("definitions/marker.bzl"), "MARKER = 'next'\n").unwrap();
+        assert_product(root, "//:metadata_product", "metadata.txt", "next");
+        return;
+    }
     let output = tempfile::tempdir().unwrap();
     let overlay = output.path().join("overlay");
     for directory in [root, overlay.as_path()] {
@@ -2028,10 +2096,37 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
     let edges = output.path().join("edges.json");
     let result = output.path().join("impacts.json");
     let products = ["metadata", "compiler", "sibling", "copied", "mixed"];
-    let stock_route = std::env::var_os("BAZEL_DIFF_STOCK_ROUTE").is_some();
+    let nested = std::env::var_os("BAZEL_DIFF_NESTED_SUPPLIER").is_some();
+    if nested {
+        edit(&root.join("ext/BUILD.bazel"), |s| format!("{s}\ntoolchain_type(name='inner_type',visibility=['//visibility:public'])\n"));
+        edit(&root.join("ext/defs.bzl"), |s| format!(r#"{s}
+def _produce(ctx):
+    tool = ctx.toolchains["@ext//:inner_type"]
+    return [DefaultInfo(files = depset([tool.runtime]))]
+
+produce = rule(implementation = _produce, toolchains = ["@ext//:inner_type"])
+"#));
+        edit(&root.join("ext/tools.bzl"), |s| {
+            s.replace("data = ctx.read(ctx.attr.source) if ctx.attr.source else ctx.attr.version",
+                      "data = ctx.read(ctx.attr.source) if ctx.attr.source else ctx.attr.version\n    nested = ctx.attr.version == 'outer-constant'").replace(
+                "ctx.file(\"BUILD.bazel\", \"\"\"load(\"@ext//:defs.bzl\", \"compiler\")",
+                "ctx.file(\"BUILD.bazel\", \"\"\"load(\"@ext//:defs.bzl\", \"compiler\", \"produce\")")
+              .replace("compiler(name = \"impl\", runtime = \":version.txt\")", "{generated}\ncompiler(name = \"impl\", runtime = \"{runtime}\")")
+              .replace("toolchain_type = \"@ext//:toolchain_type\", visibility = [\"//visibility:public\"])\n\"\"\")",
+                       "toolchain_type = \"{ty}\", visibility = [\"//visibility:public\"])\n\"\"\".format(generated='produce(name=\"generated\")' if nested else '', runtime=':generated' if nested else ':version.txt', ty='@ext//:inner_type' if ctx.attr.source != None else '@ext//:toolchain_type'))")
+             .replace("tool(name = \"tc_impl\", source = \"@@//:compiler-input.txt\")",
+               "tool(name = \"tc_impl\",version=\"outer-constant\")\n    tool(name = \"inner\",source=\"@@//:compiler-input.txt\")")
+        });
+        edit(&root.join("ext/tools.bzl"),|s|s.replace("    tool(name = \"inner\",source=\"@@//:compiler-input.txt\")","") + "\ndef _inner_type(ctx):\n    tool(name=\"inner\",source=\"@@//:compiler-input.txt\")\n\nengines=module_extension(implementation=_inner_type)\n");
+        edit(&root.join("ext/MODULE.bazel"),|s|format!("{s}\nengines=use_extension(\"//:tools.bzl\",\"engines\")\nuse_repo(engines,\"inner\")\n"));
+        edit(&root.join("relay/BUILD.bazel"), |s| s.replace("@hub//:compiler_version","@@ext++engines+inner//:version.txt"));
+    }
+    let positive_route = std::env::var_os("BAZEL_DIFF_SCOPED_POSITIVE").is_some();
+    let stock_route = positive_route || std::env::var_os("BAZEL_DIFF_STOCK_ROUTE").is_some();
     if stock_route {
         fs::write(root.join(".bazelrc"), format!("common --package_path={}:%workspace%\nbuild --extra_toolchains=@@ext++tools+tc_impl//:tc\n", overlay.display())).unwrap();
     }
+    if nested {edit(&root.join(".bazelrc"),|s|s.replace("--extra_toolchains=@@ext++tools+tc_impl//:tc","--extra_toolchains=@@ext++tools+tc_impl//:tc,@@ext++engines+inner//:tc"));}
     for (state, compiler, sibling, marker, decoy) in [
         ("base", "first", "one", "selected", "decoy"),
         ("compiler", "second", "one", "selected", "decoy"),
@@ -2085,8 +2180,27 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
             args.retain(|s| !s.starts_with("--resolveRepositoryInputs"));
             args.extend(["--useCquery", "--cqueryRootExpression=set(//:metadata_product //:compiler_product //:sibling_product //:copied_product //:mixed_product)", "--cqueryCommandOptions=--extra_toolchains=@@ext++tools+tc_impl//:tc"]);
         }
+        if nested {args.retain(|arg| !arg.starts_with("--cqueryCommandOptions")); args.push("--cqueryCommandOptions=--extra_toolchains=@@ext++tools+tc_impl//:tc,@@ext++engines+inner//:tc");}
+        if positive_route {args.retain(|arg| *arg != "--useCquery"); args.push("--verbose");}
         if state != "base" {
             args.extend(["--depEdgesFile", edges.to_str().unwrap()]);
+        }
+        if positive_route && matches!(state,"base"|"compiler"|"sibling") {
+            if let Some(binary) = std::env::var_os("BAZEL_DIFF_STOCK_BINARY") {
+                let tagged = output.path().join(format!("stock-{state}.json"));
+                let stock_edges = output.path().join("stock-edges.json");
+                let args: Vec<_> = args.iter().take_while(|arg| **arg!="--depEdgesFile").copied().filter(|arg| !arg.starts_with("--cqueryRootExpression")).collect();
+                let run=std::process::Command::new(&binary).arg("generate-hashes").arg("-w").arg(root).arg("-b").arg(bazel()).args(args).arg("--depEdgesFile").arg(&stock_edges).arg(&tagged).output().unwrap();
+                assert!(run.status.success(),"{}",String::from_utf8_lossy(&run.stderr));
+                if state!="base" {
+                    let result=output.path().join("stock-result.json");
+                    let run=std::process::Command::new(&binary).arg("get-impacted-targets").arg("-w").arg(root).arg("-b").arg(bazel()).arg("-sh").arg(output.path().join("stock-base.json")).arg("-fh").arg(&tagged).arg("--depEdgesFile").arg(&stock_edges).arg("-o").arg(&result).output().unwrap();
+                    assert!(run.status.success(),"{}",String::from_utf8_lossy(&run.stderr));
+                    let report:Vec<serde_json::Value>=serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();
+                    let actual:Vec<_>=report.iter().filter(|r|r["label"].as_str().is_some_and(|l|l.ends_with("_product"))).collect();
+                    eprintln!("stock {state}: {actual:?}");
+                }
+            }
         }
         let generation = generate(root, &snapshot, &args);
         assert!(
@@ -2094,6 +2208,7 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
             "{}",
             String::from_utf8_lossy(&generation.stderr)
         );
+        if positive_route && state == "base" {eprintln!("{}",String::from_utf8_lossy(&generation.stderr));}
         if state == "base" {
             continue;
         }
@@ -2127,7 +2242,13 @@ fn acquired_starlark_rules_share_loads_but_only_one_uses_a_compiler() {
                 })
         });
 
+        if positive_route { eprintln!("scoped {state}: {distances:?}"); if let Ok(dir) = std::env::var("BAZEL_DIFF_SCOPED_FILES") { let dir=std::path::Path::new(&dir); for (source,suffix) in [(&snapshot,"target"),(&edges,"edges"),(&result,"changed"),(&base,"base")] { std::fs::copy(source,dir.join(format!("{state}-{suffix}.json"))).unwrap(); } } }
         match state {
+            "compiler" if nested => {
+                // The second extension is outside the requested hub. Its conservative
+                // membership remains, in addition to the actual nested compiler route.
+                assert!(distances[1].is_some());assert!(distances[4].is_some());
+            },
             "compiler" => assert_eq!(distances, [None, Some((4, 3)), None, None, Some((2, 2))]),
             "sibling" => assert_eq!(distances, [None, None, Some((1, 1)), Some((2, 2)), None]),
             "loaded" => assert!(

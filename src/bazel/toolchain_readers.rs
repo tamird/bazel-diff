@@ -263,7 +263,47 @@ fn direct_type_edges(
     Some(result)
 }
 
-/// Every path lost by removing a membership has a first removed edge. Compute its
+/// The explicit-aspect DOT printer supplies adjacency under each configured parent.
+// Match an entire short display identity to exactly one full key from the proto.
+// An unrecognized child (including an aspect) invalidates just its own parent.
+/// Match existing configured occurrences. Intersecting a target pattern with the
+/// traversal may evaluate the pattern only in its top-level target configuration.
+fn filter_occurrences(labels:&BTreeSet<String>, expression:&str) -> Result<String> {
+    let patterns=labels.iter().map(|name| {
+        let name=name.trim_start_matches('@').replace(r"\E",r"\E\\E\Q");
+        format!(r"\Q{name}\E")
+    }).collect::<Vec<_>>().join("|");
+    let pattern=format!("^@*({patterns})$");
+    let pattern=super::query_labels(std::iter::once(&pattern))?;
+    Ok(format!("filter({pattern}, {expression})"))
+}
+
+fn explicit_target_edges(bytes: &[u8], keys: &HashSet<&str>) -> Option<BTreeMap<String,BTreeSet<String>>> {
+    let body = std::str::from_utf8(bytes).ok()?.trim().strip_prefix("digraph mygraph {")?.strip_suffix('}')?;
+    let mut names = HashMap::new();
+    for &key in keys {
+        let (label,checksum) = super::split_configured(key);
+        let short = match checksum {Some(hash)=>hash.get(..7)?,None=>"null"};
+        names.entry(format!("{label} ({short})")).and_modify(|entry| *entry=None).or_insert(Some(key));
+    }
+    let mut edges = BTreeMap::<String,BTreeSet<String>>::new();
+    let mut invalid = BTreeSet::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line=="node [shape=box];" {continue;}
+        let row = line.strip_prefix('"')?.strip_suffix('"')?;
+        let (parent,child)=row.split_once("\" -> \"").map_or((row,None),|(parent,child)|(parent,Some(child)));
+        let Some(&Some(parent))=names.get(parent) else {continue};
+        let values=edges.entry(parent.to_owned()).or_default();
+        if let Some(child)=child {
+            if let Some(&Some(key))=names.get(child) {values.insert(key.to_owned());}
+            else {invalid.insert(parent);}
+        }
+    }
+    edges.retain(|parent,_| !invalid.contains(parent.as_str()));
+    Some(edges)
+}
+
+// Every path lost by removing a membership has a first removed edge. Compute its
 /// possible predecessors on the repository nodes actually returned by the lowerer.
 fn affected_repositories(
     rows: &[super::RepositoryRow],
@@ -340,6 +380,17 @@ fn retain_memberships(
 }
 
 impl BazelOptions {
+    fn configured_adjacency(&self, expression:&str, keys:&HashSet<&str>) -> Result<Option<BTreeMap<String,BTreeSet<String>>>> {
+                let mut explicit = self.command();
+                let query_file = tempfile::NamedTempFile::new()?;
+                std::fs::write(query_file.path(), expression)?;
+                explicit.arg("cquery").args(&self.cquery_options)
+                    .args(["--experimental_explicit_aspects", "--consistent_labels", "--output=graph", "--nograph:factored", "--graph:node_limit=-1", "--query_file"])
+                    .arg(query_file.path());
+                let graph_output = self.run(&mut explicit)?;
+                Ok(graph_output.status.success().then(|| explicit_target_edges(&graph_output.stdout,keys)).flatten())
+    }
+
     pub(super) fn observe_external_inputs(
         &self,
         targets: &[Target],
@@ -370,7 +421,8 @@ impl BazelOptions {
         {
             return Ok(ExtensionInputs::default());
         }
-        let Some(registrations) = options.registered_toolchains(version, &graph.mapping)? else {
+        let registrations = options.registered_toolchains(version, &graph.mapping)?;
+        if registrations.is_none() && self.cquery_root_expression.is_none() {
             // MODULE dependencies may register a toolchain that never occurs in
             // this ordinary query. Keep their legacy repository inputs when the
             // producer cannot report the registrations.
@@ -384,7 +436,8 @@ impl BazelOptions {
                 &mut BTreeSet::new(),
             )?;
             return Ok(result);
-        };
+        }
+        let registrations = registrations.unwrap_or_default();
         let mut opaque = Vec::new();
         if let Some(repositories) = survey {
             let families = graph
@@ -510,7 +563,7 @@ impl BazelOptions {
             None => ExtensionInputs::default(),
         };
         let mut unresolved = BTreeSet::new();
-        let suppliers = options.supplier_inputs(
+        let mut suppliers = options.supplier_inputs(
             &mut graph,
             mapping,
             version,
@@ -525,6 +578,190 @@ impl BazelOptions {
                 family,
                 unresolved.clone(),
             );
+        }
+        if let Some(roots) = &self.cquery_root_expression {
+            // A loading query omits toolchains selected by a command-line registration or
+            // configuration transition. Ask for configured *occurrences* in the caller's
+            // actual roots: Bazel may return old configurations for a bare label pattern.
+            let families=graph.fine.iter().filter_map(|repo|super::extension_usage_prefix(repo)).map(str::to_owned).collect::<BTreeSet<_>>();
+            for row in repository_rows {
+                let unrelated=row.memberships.iter().filter(|group|!families.contains(&group.extension)).flat_map(|group|row.inferred(group)).map(str::to_owned).collect::<BTreeSet<_>>();
+                if !unrelated.is_empty() {
+                    let name=target_name(&row.target).expect("repository row");
+                    result.retained_memberships.insert(name.to_owned(),unrelated);
+                }
+            }
+            let affected = affected_repositories(repository_rows, &families);
+            let nodes = crate::hash::canonical_repo_nodes(&graph.mapping);
+            let ambiguous = graph.rows.iter().filter_map(|(name, target)| {
+                let rule = target.rule.as_option()?;
+                rule.rule_input.iter().any(|input| {
+                    let proxy = crate::hash::transform_external_input(input, &self.fine_grained_external_repos, &nodes);
+                    affected.contains(proxy.as_ref())
+                }).then(|| name.clone())
+            }).collect::<BTreeSet<_>>();
+            if !ambiguous.is_empty() {
+                let scoped = filter_occurrences(&ambiguous,&format!("deps(config(({roots}), target))"))?;
+                let expression = format!("deps(({scoped}), 1)");
+                let mut configured = self.clone();
+                configured.keep_going = false;
+                configured.cquery_options.extend(["--nokeep_going", "--implicit_deps", "--tool_deps", "--nodep_deps", "--include_aspects", "--proto:output_rule_attrs=all"].map(str::to_owned));
+                let rows = configured.query_with(&expression, true, Some(version), false, &mut |_, _| {})?;
+                let keys = rows.iter().filter_map(target_name).collect::<HashSet<_>>();
+                // If Bazel can only flatten the configured aspects into target rows the
+                // missing occurrence might carry another toolchain. Keep the original edges.
+                let explicit = configured.configured_adjacency(&expression,&keys)?;
+                let mut new_children = BTreeSet::new();
+                let mut child_instances = BTreeSet::new();
+                let mut unclosed = BTreeSet::new();
+                let mut witnessed = BTreeMap::<String,Vec<(BTreeSet<String>,BTreeSet<String>)>>::new();
+                for rule in rows.iter().filter_map(|row| row.rule.as_option()) {
+                    let name = graph.canonical(super::target_label(&rule.name));
+                    let Some(ordinary) = graph.rows.get(&name).and_then(|r| r.rule.as_option()) else {continue};
+                    if !ambiguous.contains(&name) {continue;}
+                    let known: HashSet<_> = ordinary.rule_input.iter().map(|input| graph.canonical(input)).collect();
+                    let mut extra = BTreeSet::new();
+                    let mut inputs = BTreeSet::new();
+                    let mut closed = true;
+                    for edge in &rule.configured_rule_input {
+                        let key = super::encode_configured_input(edge);
+                        let child = graph.canonical(super::target_label(&key));
+                        if !keys.contains(key.as_str()) {closed=false; continue;}
+                        // A declared custom-rule child can itself resolve a toolchain absent
+                        // from the loading graph. Cover its configured deps just as we cover
+                        // those of a compiler which appeared only at analysis time.
+                        if child != name {
+                            child_instances.insert(key.clone());
+                            new_children.insert(child.clone());
+                            if !known.contains(&child) {extra.insert(child);}
+                        }
+                        inputs.insert(key);
+                    }
+                    if closed && explicit.as_ref().and_then(|graph| graph.get(&rule.name)) == Some(&inputs) {
+                        let operands = ordinary.rule_input.iter().chain(&extra).cloned().collect();
+                        witnessed.entry(ordinary.name.clone()).or_default().push((inputs,operands));
+                    } else { unclosed.insert(ordinary.name.clone()); }
+                    result.bindings.entry(ordinary.name.clone()).or_default().push(Arc::new(extra));
+                }
+                let mut extra = Vec::new();
+                if !new_children.is_empty() {
+                    // A compiler may itself use generated inputs produced by a different
+                    // toolchain. Resolve the selected implementations in their original
+                    // configurations, not as new top-level cquery roots.
+                    let selected=filter_occurrences(&new_children,&expression)?;
+                    let reached=format!("deps({selected})");
+                    let closure = configured.query_with(&reached,true,Some(version),false,&mut |_,_|{})?;
+                    let child_keys = closure.iter().filter_map(target_name).collect::<HashSet<_>>();
+                    let precise = configured.configured_adjacency(&reached,&child_keys)?;
+                    let names = child_keys.iter().map(|key| graph.canonical(super::target_label(key))).collect::<BTreeSet<_>>();
+                    let configured_rules = closure.iter().filter_map(|row|row.rule.as_option()).map(|rule|graph.canonical(super::target_label(&rule.name))).collect::<BTreeSet<_>>();
+                    // Unexported source and loading files must be requested via their owners.
+                    if !configured_rules.is_empty() {
+                        let expression = format!("let children = deps({},1) in $children + buildfiles($children)",query_set(&configured_rules)?);
+                        let mut strict = self.clone();
+                        strict.keep_going=false;
+                        strict.command_options.extend(["--nokeep_going","--implicit_deps","--tool_deps","--proto:locations","--norelative_locations"].map(str::to_owned));
+                        extra = strict.query_with(&expression,false,Some(version),false,&mut |_,_|{})?;
+                        let definitions = strict.package_inputs_for_acquired_rules(&mut extra,0,Some(version))?;
+                        for rule in extra.iter_mut().filter_map(|row|row.rule.as_option_mut()) {
+                            if let Some((pkg,_))=rule.name.rsplit_once(':') {
+                                rule.rule_input.extend(definitions.get(pkg).into_iter().flatten().cloned());
+                                rule.rule_input.sort();rule.rule_input.dedup();
+                            }
+                        }
+                    }
+                    let ordinary = extra.iter().filter_map(|row|Some((graph.canonical(target_name(row)?),row))).collect::<BTreeMap<_,_>>();
+                    let mut complete=child_instances.iter().all(|key| child_keys.contains(key.as_str())) && names.iter().all(|name|ordinary.contains_key(name)||graph.rows.contains_key(name));
+                    let mut closures = BTreeMap::new();
+                    for rule in closure.iter().filter_map(|row|row.rule.as_option()) {
+                        let name = graph.canonical(super::target_label(&rule.name));
+                        let inputs=rule.configured_rule_input.iter().map(super::encode_configured_input).collect::<BTreeSet<_>>();
+                        if precise.as_ref().and_then(|edges|edges.get(&rule.name))!=Some(&inputs) {complete=false;}
+                        let Some(base) = ordinary.get(&name).and_then(|row|row.rule.as_option()) else {complete=false;continue;};
+                        let positive = inputs.iter().map(|key|graph.canonical(super::target_label(key))).collect::<BTreeSet<_>>();
+                        result.bindings.entry(base.name.clone()).or_default().push(Arc::new(positive.clone()));
+                        let operands = base.rule_input.iter().chain(&positive).cloned().collect();
+                        closures.entry(base.name.clone()).or_insert_with(Vec::new).push((inputs,operands));
+                    }
+                    if complete {
+                        for (name, observations) in closures {witnessed.entry(name).or_default().extend(observations);}
+                    } else {
+                        // Without the closure keep the inferred inputs on its original readers.
+                        for (name,occurrences) in &witnessed {
+                            if occurrences.iter().any(|(inputs,_)|inputs.iter().any(|key| child_instances.contains(key))) {unclosed.insert(name.clone());}
+                        }
+                    }
+                    if self.verbose {eprintln!("[Debug] closure wanted={child_instances:?} observed={child_keys:?} complete={complete}");}
+                }
+                if self.verbose {eprintln!("[Debug] explicit={}, strict rows={}, preliminary readers={witnessed:?}", explicit.is_some(),extra.len());}
+                let all_readers = witnessed.keys().map(|name|graph.canonical(name)).collect::<BTreeSet<_>>();
+                let operands = witnessed.values().flatten().flat_map(|(_, operands)| operands.iter().cloned()).collect::<BTreeSet<_>>();
+                if !operands.is_empty() {
+                    let mut strict = self.clone();
+                    strict.keep_going = false;
+                    strict.command_options.extend(["--nokeep_going","--proto:locations","--norelative_locations","--proto:rule_inputs_and_outputs"].map(str::to_owned));
+                    let expression = format!("let rows = deps({}, 1) in $rows + buildfiles($rows)",query_set(&all_readers)?);
+                    let mut materialized = BTreeSet::new();
+                    let mut source_labels = BTreeSet::new();
+                    // buildfiles() may synthesize a FileTarget at the loading BUILD's
+                    // location. Ask each source package for its own real BUILD location.
+                    let mut packages=BTreeSet::new();
+                    strict.query_with_filtered(&expression,false,Some(version),false,&mut |_,_|{},|row| {
+                        let Some(name)=target_name(row) else {return false};
+                        if let Some(source) = row.source_file.as_option() {
+                            if let Some((package,_))=name.rsplit_once(':') {
+                                source_labels.insert(graph.canonical(&source.name));
+                                packages.insert(format!("{package}:all"));
+                            }
+                            return false;
+                        }
+                        materialized.insert(graph.canonical(name));
+                        false
+                    })?;
+                    if !packages.is_empty() {
+                        let mut build_patterns=BTreeSet::new();
+                        for package in &packages {
+                            if let Some((package,_))=package.rsplit_once(':') {build_patterns.insert(format!("{package}:*"));}
+                        }
+                        let query=format!("filter(':BUILD(\\.bazel)?$', {})",query_set(&build_patterns)?);
+                        let mut directories=BTreeMap::<String,BTreeSet<std::path::PathBuf>>::new();
+                        strict.query_with_filtered(&query,false,Some(version),false,&mut |_,_|{},|row| {
+                            let Some(source)=row.source_file.as_option() else {return false;};
+                            let Some((pkg,file))=graph.canonical(&source.name).rsplit_once(':').map(|(p,f)|(p.to_owned(),f.to_owned())) else {return false};
+                            if !matches!(file.as_str(),"BUILD"|"BUILD.bazel") {return false;}
+                            let Some(loc)=source.location.as_deref() else {return false;};
+                            let path=std::path::Path::new(crate::hash::starlark_stack_path(loc));
+                            if path.is_absolute() && path.file_name().and_then(|n|n.to_str())==Some(&file) {
+                                if let Some(dir)=path.parent() {directories.entry(pkg).or_default().insert(dir.to_owned());}
+                            }
+                            false
+                        })?;
+                        for label in source_labels {
+                            let Some((pkg,file))=label.rsplit_once(':') else {continue};
+                            let Some(dirs)=directories.get(pkg) else {continue};
+                            if dirs.len()==1 {
+                                let file=dirs.first().expect("single directory").join(file);
+                                if file.is_file() {result.scoped_locations.insert(label.clone(),file);materialized.insert(label);}
+                            }
+                        }
+                    }
+                    if self.verbose {eprintln!("[Debug] bound inputs {materialized:?}, paths {:?}",result.scoped_locations);}
+                    for (name, occurrences) in witnessed {
+                        if unclosed.contains(&name) {continue;}
+                        let Some((inputs,operands)) = occurrences.first() else {continue};
+                        if occurrences.iter().all(|(observed,_)| observed == inputs)
+                            && operands.iter().all(|operand| materialized.contains(&graph.canonical(operand))) {
+                            if self.verbose {eprintln!("[Debug] qualified {name}");}
+                            let operands=operands.iter().filter(|input| {
+                                let repo = crate::hash::transform_external_input(input,&self.fine_grained_external_repos,&nodes);
+                                affected.contains(repo.as_ref())
+                            }).cloned().collect();
+                            result.scoped_readers.insert(name,operands);
+                        }
+                    }
+                }
+                suppliers.append(&mut extra);
+            }
         }
         drop(graph);
         recovered.extend(suppliers);
@@ -1137,6 +1374,9 @@ impl BazelOptions {
 
 #[derive(Default)]
 pub(super) struct ExtensionInputs {
+    pub(super) scoped_readers: BTreeMap<String, BTreeSet<String>>,
+    pub(super) retained_memberships: BTreeMap<String,BTreeSet<String>>,
+    pub(super) scoped_locations: BTreeMap<String, std::path::PathBuf>,
     pub(super) declarations: BTreeMap<String, Arc<BTreeSet<String>>>,
     pub(super) registration_hashes: BTreeMap<String, [u8; 32]>,
     pub(super) supplier_hashes: BTreeMap<String, [u8; 32]>,
